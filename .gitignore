@@ -1,0 +1,13 @@
+*.avi
+*.mp4
+*.mp3
+*.wav
+*.m4a
+*.m4v
+*.mov
+*.wmv
+*.flv
+*.webm
+
+logs/
+*__pycache__/
