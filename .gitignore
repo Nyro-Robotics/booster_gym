@@ -10,4 +10,5 @@
 *.webm
 
 logs/
+videos/
 *__pycache__/
