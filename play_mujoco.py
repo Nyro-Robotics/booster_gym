@@ -931,7 +931,6 @@ def initialize_simulation(cfg: Dict[str, Any], args: argparse.Namespace) -> Tupl
         try:
             # We'll use the built-in viewer in the main loop
             use_viewer = True  # Just a flag to indicate we want to use the viewer
-            print("Will use MuJoCo's built-in viewer (rendering live)")
         except Exception as e:
             print(f"Error preparing for MuJoCo viewer: {str(e)}")
             print("Falling back to headless mode.")
@@ -1046,7 +1045,7 @@ def main() -> None:
             # Use the imported viewer module, not the boolean flag
             with mujoco.viewer.launch_passive(sim_state.mj_model, sim_state.mj_data) as viewer_window:
                 # Set initial camera settings
-                viewer_window.cam.azimuth = 180  # Start behind the robot (180 degrees)
+                viewer_window.cam.azimuth = 0  # Start behind the robot (180 degrees)
                 viewer_window.cam.elevation = -20
                 viewer_window.cam.distance = rendering_config.camera_settings['distance']
                 
