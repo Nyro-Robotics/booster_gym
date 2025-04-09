@@ -31,6 +31,8 @@ import attrs
 
 os.environ['PYGAME_HIDE_SUPPORT_PROMPT'] = '1'
 
+# -- Attributes --
+
 @attrs.define
 class SimulationState:
     """Class to hold the current state of the simulation."""
@@ -77,6 +79,7 @@ class RenderingConfig:
     camera_settings: Dict[str, float] = attrs.Factory(dict)
     mujoco_file: str = ""
 
+# -- Control --
 
 class ControlInterface(ABC):
     """Abstract base class for control interfaces."""
@@ -273,6 +276,7 @@ class KeyboardControl(ControlInterface):
         
         return True
 
+# -- Misc --
 
 def quat_rotate_inverse(q: np.ndarray, v: np.ndarray) -> np.ndarray:
     """Rotate a vector by the inverse of a quaternion.
@@ -325,6 +329,8 @@ def restore_state(mj_data: mujoco.MjData, mj_model: mujoco.MjModel, state: Dict[
     mj_data.qvel[:] = state['qvel']
     mujoco.mj_forward(mj_model, mj_data)
 
+
+# -- Video Recording --
 
 def create_video_writer(output_path: str, fps: int, width: int, height: int) -> Tuple[Optional[cv2.VideoWriter], Optional[str]]:
     """Create a video writer with an appropriate codec.
@@ -680,6 +686,7 @@ def render_video_from_states(recording_state: RecordingState, dt: float, cfg: Di
     # Clear stored states to free memory
     recording_state.stored_states.clear()
 
+# -- Simulation --
 
 def update_gait_frequency(sim_state: SimulationState, cfg_commands: Dict[str, Any], max_linear_vel: float, max_angular_vel: float) -> None:
     """Update gait frequency based on command velocity.
