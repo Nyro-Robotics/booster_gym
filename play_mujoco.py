@@ -199,19 +199,19 @@ class JoystickControl(ControlInterface):
             try:
                 # Get joystick axes values (-1.0 to 1.0)
                 # Left stick Y-axis (inverted: up is negative, down is positive)
-                lin_vel_x = -self.joystick.get_axis(1) * self.max_linear_vel
+                lin_vel_x = -self.joystick.get_axis(1) * self.max_linear_vel / 2
                 
                 # Left stick X-axis (left is negative, right is positive)
-                lin_vel_y = -self.joystick.get_axis(0) * self.max_linear_vel
+                lin_vel_y = -self.joystick.get_axis(0) * self.max_linear_vel / 2
                 
                 # Right stick X-axis for yaw control
-                ang_vel_yaw = -self.joystick.get_axis(3) * self.max_angular_vel
+                ang_vel_yaw = -self.joystick.get_axis(3) * self.max_angular_vel / 2
                 
                 # Apply deadzone to prevent drift when joystick is near center
                 deadzone = 0.1
-                lin_vel_x = 0.0 if abs(lin_vel_x) < deadzone * self.max_linear_vel else lin_vel_x
-                lin_vel_y = 0.0 if abs(lin_vel_y) < deadzone * self.max_linear_vel else lin_vel_y
-                ang_vel_yaw = 0.0 if abs(ang_vel_yaw) < deadzone * self.max_angular_vel else ang_vel_yaw
+                lin_vel_x = 0.0 if abs(lin_vel_x) < deadzone * self.max_linear_vel / 2 else lin_vel_x
+                lin_vel_y = 0.0 if abs(lin_vel_y) < deadzone * self.max_linear_vel / 2 else lin_vel_y
+                ang_vel_yaw = 0.0 if abs(ang_vel_yaw) < deadzone * self.max_angular_vel / 2 else ang_vel_yaw
                 
                 # Button mapping (adjust button indices based on your controller)
                 # Process events for button presses
@@ -926,20 +926,19 @@ def initialize_simulation(cfg: Dict[str, Any], args: argparse.Namespace) -> Tupl
     # If headless_record is True, also set headless to True
     if args.headless_record:
         args.headless = True
-        
-    print(f"Headless: {args.headless}, Headless record: {args.headless_record}")
     
     if not args.headless:
         try:
             # We'll use the built-in viewer in the main loop
             use_viewer = True  # Just a flag to indicate we want to use the viewer
-            print("Will use MuJoCo's built-in viewer in the main loop")
+            print("Will use MuJoCo's built-in viewer (rendering live)")
         except Exception as e:
             print(f"Error preparing for MuJoCo viewer: {str(e)}")
             print("Falling back to headless mode.")
             args.headless = True
+    else:
+        print("Rendering headless")
     
-    print(f"Final use_viewer value: {use_viewer}")
     return sim_state, recording_state, rendering_config, use_viewer
 
 
@@ -1038,20 +1037,18 @@ def main() -> None:
     
     # Main simulation loop
     running = True
-    print(f"Before loop, use_viewer is: {viewer}")
-    
+
     try:
         # If using the built-in viewer, launch it in passive mode
         if viewer:
-            print("Launching MuJoCo built-in viewer in passive mode...")
+            print("Launching MuJoCo built-in viewer...")
             
             # Use the imported viewer module, not the boolean flag
             with mujoco.viewer.launch_passive(sim_state.mj_model, sim_state.mj_data) as viewer_window:
-                # Set camera settings
-                viewer_window.cam.azimuth = 0
+                # Set initial camera settings
+                viewer_window.cam.azimuth = 180  # Start behind the robot (180 degrees)
                 viewer_window.cam.elevation = -20
                 viewer_window.cam.distance = rendering_config.camera_settings['distance']
-                viewer_window.cam.lookat = np.array(cfg["viewer"]["lookat"])
                 
                 # Main simulation loop
                 while running:
@@ -1073,6 +1070,24 @@ def main() -> None:
                     
                     # Update recording if needed
                     update_recording(sim_state, recording_state)
+                    
+                    # Update camera to follow the robot
+                    robot_pos = sim_state.mj_data.qpos[:3].copy()  # Get robot position
+                    robot_quat = sim_state.mj_data.qpos[3:7].copy()  # Get robot orientation quaternion
+                    
+                    # Set camera lookat to robot position
+                    viewer_window.cam.lookat = robot_pos
+                    
+                    # Optionally adjust azimuth based on robot orientation
+                    # This will make the camera follow behind the robot as it turns
+                    # Extract yaw angle from quaternion (simplified)
+                    # Note: This is a simplified calculation and might need adjustment
+                    qw, qx, qy, qz = robot_quat
+                    yaw = np.arctan2(2.0 * (qw * qz + qx * qy), 1.0 - 2.0 * (qy * qy + qz * qz))
+                    yaw_degrees = np.degrees(yaw)
+                    
+                    # Set camera azimuth to be behind the robot (180 degrees offset from robot's facing direction)
+                    viewer_window.cam.azimuth = yaw_degrees + 180
                     
                     # Update the viewer
                     viewer_window.sync()
