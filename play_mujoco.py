@@ -957,6 +957,8 @@ def initialize_simulation(cfg: Dict[str, Any], args: argparse.Namespace) -> Tupl
             viewer = mujoco_viewer.MujocoViewer(
                 mj_model, mj_data, width=recording_state.width, height=recording_state.height
             )
+            # Make sure the viewer is properly initialized
+            viewer.render()
             print("MuJoCo viewer initialized successfully.")
         except Exception as e:
             print(f"Error initializing MuJoCo viewer: {str(e)}")
@@ -1072,41 +1074,48 @@ def main() -> None:
     
     # Main simulation loop
     running = True
-    while running and ((viewer is None) or (viewer is not None and viewer.is_alive)):
-        # Check if window was closed by user
-        if viewer is not None and not viewer.is_alive:
-            print("Viewer window was closed.")
-            break
+    try:
+        while running and ((viewer is None) or (viewer is not None and viewer.is_alive)):
+            # Check if window was closed by user
+            if viewer is not None and not viewer.is_alive:
+                print("Viewer window was closed.")
+                break
+            
+            # Process user input
+            running = control_interface.process_input(sim_state, recording_state, cfg, args)
+            if not running:
+                break
+            
+            # Update gait frequency based on command velocity
+            update_gait_frequency(
+                sim_state, 
+                cfg["commands"], 
+                args.max_linear_vel, 
+                args.max_angular_vel
+            )
+            
+            step_simulation(sim_state, cfg, cfg["normalization"])
+            update_recording(sim_state, recording_state)
+            update_viewer(sim_state, viewer)
+            
+            # Add a small sleep to prevent the simulation from running too fast
+            if viewer is not None:
+                time.sleep(0.001)  # Small sleep to allow GUI to update
+    except KeyboardInterrupt:
+        print("\nSimulation interrupted by user.")
+    finally:
+        # Clean up resources
+        if viewer is not None:
+            viewer.close()
         
-        # Process user input
-        running = control_interface.process_input(sim_state, recording_state, cfg, args)
-        if not running:
-            break
+        # Make sure to release the video writer when done
+        if recording_state.video_writer is not None:
+            recording_state.video_writer.release()
         
-        # Update gait frequency based on command velocity
-        update_gait_frequency(
-            sim_state, 
-            cfg["commands"], 
-            args.max_linear_vel, 
-            args.max_angular_vel
-        )
-        
-        step_simulation(sim_state, cfg, cfg["normalization"])
-        update_recording(sim_state, recording_state)
-        update_viewer(sim_state, viewer)
-    
-    # Clean up resources
-    if viewer is not None:
-        viewer.close()
-    
-    # Make sure to release the video writer when done
-    if recording_state.video_writer is not None:
-        recording_state.video_writer.release()
-    
-    # Clean up pygame if we used joystick
-    if not args.no_joystick and isinstance(control_interface, JoystickControl) and control_interface.joystick is not None:
-        pygame.joystick.quit()
-        pygame.quit()
+        # Clean up pygame if we used joystick
+        if not args.no_joystick and isinstance(control_interface, JoystickControl) and control_interface.joystick is not None:
+            pygame.joystick.quit()
+            pygame.quit()
 
 
 if __name__ == "__main__":
