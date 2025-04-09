@@ -205,13 +205,13 @@ class JoystickControl(ControlInterface):
                 lin_vel_y = -self.joystick.get_axis(0) * self.max_linear_vel / 2
                 
                 # Right stick X-axis for yaw control
-                ang_vel_yaw = -self.joystick.get_axis(3) * self.max_angular_vel / 2
+                ang_vel_yaw = -self.joystick.get_axis(3) * self.max_angular_vel
                 
                 # Apply deadzone to prevent drift when joystick is near center
                 deadzone = 0.1
                 lin_vel_x = 0.0 if abs(lin_vel_x) < deadzone * self.max_linear_vel / 2 else lin_vel_x
                 lin_vel_y = 0.0 if abs(lin_vel_y) < deadzone * self.max_linear_vel / 2 else lin_vel_y
-                ang_vel_yaw = 0.0 if abs(ang_vel_yaw) < deadzone * self.max_angular_vel / 2 else ang_vel_yaw
+                ang_vel_yaw = 0.0 if abs(ang_vel_yaw) < deadzone * self.max_angular_vel else ang_vel_yaw
                 
                 # Button mapping (adjust button indices based on your controller)
                 # Process events for button presses
@@ -1045,7 +1045,7 @@ def main() -> None:
             # Use the imported viewer module, not the boolean flag
             with mujoco.viewer.launch_passive(sim_state.mj_model, sim_state.mj_data) as viewer_window:
                 # Set initial camera settings
-                viewer_window.cam.azimuth = 0  # Start behind the robot (180 degrees)
+                viewer_window.cam.azimuth = 0
                 viewer_window.cam.elevation = -20
                 viewer_window.cam.distance = rendering_config.camera_settings['distance']
                 
@@ -1086,7 +1086,7 @@ def main() -> None:
                     yaw_degrees = np.degrees(yaw)
                     
                     # Set camera azimuth to be behind the robot (180 degrees offset from robot's facing direction)
-                    viewer_window.cam.azimuth = yaw_degrees + 180
+                    viewer_window.cam.azimuth = yaw_degrees
                     
                     # Update the viewer
                     viewer_window.sync()
