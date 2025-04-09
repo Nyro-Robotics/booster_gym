@@ -28,6 +28,7 @@ from tqdm import tqdm
 from typing import Dict, List, Tuple, Optional, Any, Union, Deque
 from abc import ABC, abstractmethod
 import attrs
+from mujoco import viewer
 
 os.environ['PYGAME_HIDE_SUPPORT_PROMPT'] = '1'
 
@@ -800,7 +801,7 @@ def update_recording(sim_state: SimulationState, recording_state: RecordingState
             print(f"Stored {len(recording_state.stored_states)} frames ({sim_time:.2f}s of simulation time)")
 
 
-def initialize_simulation(cfg: Dict[str, Any], args: argparse.Namespace) -> Tuple[SimulationState, RecordingState, RenderingConfig, Optional[mujoco_viewer.MujocoViewer]]:
+def initialize_simulation(cfg: Dict[str, Any], args: argparse.Namespace) -> Tuple[SimulationState, RecordingState, RenderingConfig, Optional[Any]]:
     """Initialize the simulation state, recording state, and viewer.
     
     Args:
@@ -919,41 +920,17 @@ def initialize_simulation(cfg: Dict[str, Any], args: argparse.Namespace) -> Tupl
         mujoco_file=cfg["asset"]["mujoco_file"]
     )
     
-    # Create the viewer object using mujoco_viewer for interactive display
+    # Create the viewer object using MuJoCo's built-in viewer
     viewer = None
     if not (args.headless or args.headless_record):
         try:
-            # Try different backends in order
-            backends = ['glfw', 'egl', 'osmesa']
-            
-            for backend in backends:
-                try:
-                    # Set environment variable for rendering
-                    os.environ['MUJOCO_GL'] = backend
-                    print(f"Trying MuJoCo rendering with {backend} backend")
-                    
-                    # Create a simple viewer without extra parameters
-                    viewer = mujoco_viewer.MujocoViewer(mj_model, mj_data)
-                    
-                    # Test if it works
-                    viewer.render()
-                    print(f"MuJoCo viewer initialized successfully with {backend}")
-                    break
-                except Exception as e:
-                    print(f"Failed with {backend}: {str(e)}")
-                    if viewer is not None:
-                        try:
-                            viewer.close()
-                        except:
-                            pass
-                        viewer = None
-            
-            if viewer is None:
-                print("All rendering backends failed. Falling back to headless mode.")
-                args.headless = True
-                
+            print("Initializing MuJoCo built-in viewer...")
+            # We'll use a different approach - we'll return the model and data
+            # and use the built-in viewer in the main loop
+            viewer = True  # Just a flag to indicate we want to use the viewer
+            print("MuJoCo viewer will be initialized in the main loop")
         except Exception as e:
-            print(f"Error initializing MuJoCo viewer: {str(e)}")
+            print(f"Error preparing for MuJoCo viewer: {str(e)}")
             print("Falling back to headless mode.")
             args.headless = True
     
@@ -1134,42 +1111,64 @@ def main() -> None:
     # Main simulation loop
     running = True
     try:
-        while running:
-            # Process user input
-            running = control_interface.process_input(sim_state, recording_state, cfg, args)
-            if not running:
-                break
+        # If using the built-in viewer, launch it in a special way
+        if viewer is True:
+            print("Launching MuJoCo built-in viewer...")
             
-            # Update gait frequency based on command velocity
-            update_gait_frequency(
-                sim_state, 
-                cfg["commands"], 
-                args.max_linear_vel, 
-                args.max_angular_vel
-            )
+            # Define a callback function for the viewer
+            def simulation_callback(model, data):
+                # Process user input (simplified for viewer mode)
+                nonlocal running
+                
+                # Update gait frequency
+                update_gait_frequency(
+                    sim_state, 
+                    cfg["commands"], 
+                    args.max_linear_vel, 
+                    args.max_angular_vel
+                )
+                
+                # Step the simulation using our custom function
+                step_simulation(sim_state, cfg, cfg["normalization"])
+                
+                # Update recording if needed
+                update_recording(sim_state, recording_state)
+                
+                # Return True to continue, False to stop
+                return running
             
-            # Step the simulation
-            step_simulation(sim_state, cfg, cfg["normalization"])
-            
-            # Update recording if needed
-            update_recording(sim_state, recording_state)
-            
-            # Render the viewer
-            if viewer is not None:
-                if not viewer.is_alive:
-                    print("Viewer window was closed.")
+            # Launch the viewer with our callback
+            viewer.launch(sim_state.mj_model, sim_state.mj_data, callback=simulation_callback)
+            print("Viewer closed.")
+        else:
+            # Regular headless loop
+            while running:
+                # Process user input
+                running = control_interface.process_input(sim_state, recording_state, cfg, args)
+                if not running:
                     break
-                viewer.render()
-            
-            # Small sleep to prevent CPU overload
-            time.sleep(0.001)
-            
+                
+                # Update gait frequency
+                update_gait_frequency(
+                    sim_state, 
+                    cfg["commands"], 
+                    args.max_linear_vel, 
+                    args.max_angular_vel
+                )
+                
+                # Step the simulation
+                step_simulation(sim_state, cfg, cfg["normalization"])
+                
+                # Update recording if needed
+                update_recording(sim_state, recording_state)
+                
+                # Small sleep to prevent CPU overload
+                time.sleep(0.001)
+                
     except KeyboardInterrupt:
         print("\nSimulation interrupted by user.")
     finally:
-        # Clean up resources
-        if viewer is not None:
-            viewer.close()
+        # Clean up resources (no need to close the built-in viewer)
         
         # Make sure to release the video writer when done
         if recording_state.video_writer is not None:
