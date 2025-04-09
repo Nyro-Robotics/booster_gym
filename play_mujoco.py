@@ -921,33 +921,26 @@ def initialize_simulation(cfg: Dict[str, Any], args: argparse.Namespace) -> Tupl
     )
     
     # Create the viewer object using MuJoCo's built-in viewer
-    viewer = None
-    if not (args.headless or args.headless_record):
+    use_viewer = False  # Flag to indicate if we should use the viewer
+    
+    # If headless_record is True, also set headless to True
+    if args.headless_record:
+        args.headless = True
+        
+    print(f"Headless: {args.headless}, Headless record: {args.headless_record}")
+    
+    if not args.headless:
         try:
-            print("Initializing MuJoCo built-in viewer...")
-            # We'll use a different approach - we'll return the model and data
-            # and use the built-in viewer in the main loop
-            viewer = True  # Just a flag to indicate we want to use the viewer
-            print("MuJoCo viewer will be initialized in the main loop")
+            # We'll use the built-in viewer in the main loop
+            use_viewer = True  # Just a flag to indicate we want to use the viewer
+            print("Will use MuJoCo's built-in viewer in the main loop")
         except Exception as e:
             print(f"Error preparing for MuJoCo viewer: {str(e)}")
             print("Falling back to headless mode.")
             args.headless = True
     
-    # Apply camera settings from config
-    if viewer:
-        viewer.cam.elevation = -20  # Default elevation
-        if hasattr(viewer.cam, 'azimuth'):
-            viewer.cam.azimuth = 0  # Default azimuth
-        
-        # Set camera position and lookat from config
-        if hasattr(viewer.cam, 'distance'):
-            viewer.cam.distance = rendering_config.camera_settings['distance']
-        
-        # Set lookat point
-        viewer.cam.lookat[:] = camera_lookat
-    
-    return sim_state, recording_state, rendering_config, viewer
+    print(f"Final use_viewer value: {use_viewer}")
+    return sim_state, recording_state, rendering_config, use_viewer
 
 
 def main() -> None:
@@ -983,9 +976,10 @@ def main() -> None:
         cfg["basic"]["checkpoint"] = args.checkpoint
 
     # Override record setting if specified in config
-    if cfg["viewer"]["record_video"] and not args.headless_record:
-        args.headless_record = True
-        print("Recording enabled based on config settings")
+    # if cfg["viewer"]["record_video"] and not args.headless_record:
+    #     args.headless_record = True
+    #     args.headless = True  # Also set headless to True
+    #     print("Recording enabled based on config settings")
     
     # Add timestamp to output filename to avoid overwriting
     if args.output:
@@ -1044,79 +1038,47 @@ def main() -> None:
     
     # Main simulation loop
     running = True
+    print(f"Before loop, use_viewer is: {viewer}")
+    
     try:
-        # If using the built-in viewer, launch it in a special way
-        if viewer is True:
-            print("Launching MuJoCo built-in viewer...")
+        # If using the built-in viewer, launch it in passive mode
+        if viewer:
+            print("Launching MuJoCo built-in viewer in passive mode...")
             
-            # Define a callback function for the viewer
-            def simulation_callback(model, data):
-                nonlocal running
-                nonlocal sim_state
-                nonlocal recording_state
+            # Use the imported viewer module, not the boolean flag
+            with mujoco.viewer.launch_passive(sim_state.mj_model, sim_state.mj_data) as viewer_window:
+                # Set camera settings
+                viewer_window.cam.azimuth = 0
+                viewer_window.cam.elevation = -20
+                viewer_window.cam.distance = rendering_config.camera_settings['distance']
+                viewer_window.cam.lookat = np.array(cfg["viewer"]["lookat"])
                 
-                # Process keyboard input if available
-                if select.select([sys.stdin], [], [], 0)[0]:
-                    try:
-                        input_str = sys.stdin.readline().strip()
-                        if input_str == "q":
-                            running = False
-                            return False  # Stop the viewer
-                        elif input_str == "r":
-                            control_interface.start_recording(recording_state)
-                        elif input_str == "s":
-                            control_interface.stop_recording(recording_state, sim_state.mj_model.opt.timestep, cfg, args)
-                        elif len(input_str.split()) == 3:
-                            sim_state.lin_vel_x, sim_state.lin_vel_y, sim_state.ang_vel_yaw = map(float, input_str.split())
-                            print(f"Updated command to: x={sim_state.lin_vel_x}, y={sim_state.lin_vel_y}, yaw={sim_state.ang_vel_yaw}")
-                    except ValueError:
-                        print("Invalid input. Enter three numeric values or r/s/q.")
-                
-                # Process joystick input if available
-                if isinstance(control_interface, JoystickControl) and control_interface.joystick is not None:
-                    pygame.event.pump()
-                    new_lin_vel_x, new_lin_vel_y, new_ang_vel_yaw, button_states = control_interface.get_joystick_input()
+                # Main simulation loop
+                while running:
+                    # Process user input
+                    running = control_interface.process_input(sim_state, recording_state, cfg, args)
+                    if not running:
+                        break
                     
-                    # Update velocities with smoothing
-                    smoothing = 0.2
-                    sim_state.lin_vel_x = sim_state.lin_vel_x * (1 - smoothing) + new_lin_vel_x * smoothing
-                    sim_state.lin_vel_y = sim_state.lin_vel_y * (1 - smoothing) + new_lin_vel_y * smoothing
-                    sim_state.ang_vel_yaw = sim_state.ang_vel_yaw * (1 - smoothing) + new_ang_vel_yaw * smoothing
+                    # Update gait frequency
+                    update_gait_frequency(
+                        sim_state, 
+                        cfg["commands"], 
+                        args.max_linear_vel, 
+                        args.max_angular_vel
+                    )
                     
-                    # Process button presses
-                    if button_states['record'] and not recording_state.headless_recording:
-                        control_interface.start_recording(recording_state)
-                    elif button_states['stop'] and recording_state.headless_recording:
-                        control_interface.stop_recording(recording_state, sim_state.mj_model.opt.timestep, cfg, args)
-                    elif button_states['quit']:
-                        running = False
-                        return False  # Stop the viewer
-                
-                # Update gait frequency
-                update_gait_frequency(
-                    sim_state, 
-                    cfg["commands"], 
-                    args.max_linear_vel, 
-                    args.max_angular_vel
-                )
-                
-                # Step the simulation using our custom function
-                step_simulation(sim_state, cfg, cfg["normalization"])
-                
-                # Update recording if needed
-                update_recording(sim_state, recording_state)
-                
-                # Display command info occasionally
-                if sim_state.iteration % 100 == 0:
-                    print(f"\rCommand: x={sim_state.lin_vel_x:.2f}, y={sim_state.lin_vel_y:.2f}, yaw={sim_state.ang_vel_yaw:.2f}", end='')
-                
-                # Return True to continue, False to stop
-                return running
-            
-            # Launch the viewer with our callback
-            # Set key_callback=None to prevent the viewer from handling keyboard input itself
-            viewer.launch(sim_state.mj_model, sim_state.mj_data, callback=simulation_callback, key_callback=None)
-            print("Viewer closed.")
+                    # Step the simulation
+                    step_simulation(sim_state, cfg, cfg["normalization"])
+                    
+                    # Update recording if needed
+                    update_recording(sim_state, recording_state)
+                    
+                    # Update the viewer
+                    viewer_window.sync()
+                    
+                    # Small sleep to prevent CPU overload
+                    time.sleep(0.001)
         else:
             # Regular headless loop
             while running:
@@ -1141,11 +1103,11 @@ def main() -> None:
                 
                 # Small sleep to prevent CPU overload
                 time.sleep(0.001)
-                
+            
     except KeyboardInterrupt:
         print("\nSimulation interrupted by user.")
     finally:
-        # Clean up resources (no need to close the built-in viewer)
+        # Clean up resources
         
         # Make sure to release the video writer when done
         if recording_state.video_writer is not None:
