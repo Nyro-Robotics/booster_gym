@@ -771,16 +771,8 @@ def update_viewer(sim_state: SimulationState, viewer: Optional[mujoco_viewer.Muj
             robot_pos = sim_state.mj_data.qpos.astype(np.float32)[0:3]
             viewer.cam.lookat[:] = robot_pos
             
-            # Force synchronization with the simulation state
-            viewer.sync()
-            
-            # Render the scene
+            # Render the scene - this is all we need
             viewer.render()
-            
-            # Add command text overlay
-            command_text = f"x={sim_state.lin_vel_x:.2f}, y={sim_state.lin_vel_y:.2f}, yaw={sim_state.ang_vel_yaw:.2f}"
-            if hasattr(viewer, 'add_overlay'):
-                viewer.add_overlay(mujoco.mjtFont.mjFONT_NORMAL, mujoco.mjtGridPos.mjGRID_TOPRIGHT, command_text)
                 
         except Exception as e:
             print(f"Error updating viewer: {str(e)}")
@@ -931,32 +923,24 @@ def initialize_simulation(cfg: Dict[str, Any], args: argparse.Namespace) -> Tupl
     viewer = None
     if not (args.headless or args.headless_record):
         try:
-            # Try different rendering backends
-            backends_to_try = ['glfw', 'egl', 'osmesa']
+            # Try different backends in order
+            backends = ['glfw', 'egl', 'osmesa']
             
-            for backend in backends_to_try:
+            for backend in backends:
                 try:
-                    # Set the rendering backend
-                    print(f"Trying MuJoCo rendering backend: {backend}")
+                    # Set environment variable for rendering
                     os.environ['MUJOCO_GL'] = backend
+                    print(f"Trying MuJoCo rendering with {backend} backend")
                     
-                    # Create the viewer with the current backend
-                    viewer = mujoco_viewer.MujocoViewer(
-                        mj_model, mj_data, 
-                        width=recording_state.width, 
-                        height=recording_state.height,
-                        # Force window mode instead of offscreen
-                        mode='window'
-                    )
+                    # Create a simple viewer without extra parameters
+                    viewer = mujoco_viewer.MujocoViewer(mj_model, mj_data)
                     
-                    # Test if the viewer works by rendering a frame
+                    # Test if it works
                     viewer.render()
-                    
-                    # If we get here without an exception, the viewer is working
-                    print(f"MuJoCo viewer initialized successfully with backend: {backend}")
+                    print(f"MuJoCo viewer initialized successfully with {backend}")
                     break
-                except Exception as backend_error:
-                    print(f"Backend {backend} failed: {str(backend_error)}")
+                except Exception as e:
+                    print(f"Failed with {backend}: {str(e)}")
                     if viewer is not None:
                         try:
                             viewer.close()
@@ -965,7 +949,8 @@ def initialize_simulation(cfg: Dict[str, Any], args: argparse.Namespace) -> Tupl
                         viewer = None
             
             if viewer is None:
-                raise RuntimeError("All rendering backends failed")
+                print("All rendering backends failed. Falling back to headless mode.")
+                args.headless = True
                 
         except Exception as e:
             print(f"Error initializing MuJoCo viewer: {str(e)}")
@@ -994,13 +979,24 @@ def check_mujoco_installation():
         import mujoco
         print(f"MuJoCo version: {mujoco.__version__}")
         
-        available_plugins = mujoco.get_available_plugins()
-        print(f"Available rendering backends: {available_plugins}")
-        
-        if not available_plugins:
-            print("WARNING: No rendering backends available. You may need to install additional libraries.")
-            print("For Ubuntu/Debian: sudo apt-get install -y libgl1-mesa-dev libgl1-mesa-glx libosmesa6-dev libglew-dev libglfw3-dev")
-            print("For MacOS: brew install glfw glew mesalib-glw")
+        # Try to get available plugins - this might not be available in all versions
+        try:
+            if hasattr(mujoco, 'get_available_plugins'):
+                available_plugins = mujoco.get_available_plugins()
+                print(f"Available rendering backends: {available_plugins}")
+                
+                if not available_plugins:
+                    print("WARNING: No rendering backends available. You may need to install additional libraries.")
+            else:
+                # For MuJoCo versions that don't have get_available_plugins
+                print("MuJoCo version doesn't provide get_available_plugins method.")
+                print("Will try different rendering backends automatically.")
+        except Exception as plugin_error:
+            print(f"Could not check available plugins: {plugin_error}")
+            
+        # Suggest installation of libraries regardless
+        print("For Ubuntu/Debian: sudo apt-get install -y libgl1-mesa-dev libgl1-mesa-glx libosmesa6-dev libglew-dev libglfw3-dev")
+        print("For MacOS: brew install glfw glew mesalib-glw")
         
         return True
     except ImportError:
@@ -1008,6 +1004,30 @@ def check_mujoco_installation():
         return False
     except Exception as e:
         print(f"ERROR checking MuJoCo installation: {str(e)}")
+        return False
+
+
+def check_gl_libraries():
+    """Check if OpenGL libraries are properly installed."""
+    try:
+        import ctypes
+        try:
+            # Try to load OpenGL library
+            ctypes.cdll.LoadLibrary('libGL.so.1')
+            print("OpenGL library found.")
+        except OSError:
+            print("WARNING: Could not load OpenGL library.")
+        
+        try:
+            # Try to load GLFW library
+            ctypes.cdll.LoadLibrary('libglfw.so.3')
+            print("GLFW library found.")
+        except OSError:
+            print("WARNING: Could not load GLFW library.")
+            
+        return True
+    except Exception as e:
+        print(f"Error checking GL libraries: {str(e)}")
         return False
 
 
@@ -1023,6 +1043,9 @@ def main() -> None:
         
     # This needs to be called before any other multiprocessing code
     mp.set_start_method('spawn', force=True)
+    
+    # Check OpenGL libraries
+    check_gl_libraries()
     
     parser = argparse.ArgumentParser()
     parser.add_argument("--task", required=True, type=str, help="Name of the task to run.")
@@ -1111,12 +1134,7 @@ def main() -> None:
     # Main simulation loop
     running = True
     try:
-        while running and ((viewer is None) or (viewer is not None and viewer.is_alive)):
-            # Check if window was closed by user
-            if viewer is not None and not viewer.is_alive:
-                print("Viewer window was closed.")
-                break
-            
+        while running:
             # Process user input
             running = control_interface.process_input(sim_state, recording_state, cfg, args)
             if not running:
@@ -1130,13 +1148,22 @@ def main() -> None:
                 args.max_angular_vel
             )
             
+            # Step the simulation
             step_simulation(sim_state, cfg, cfg["normalization"])
-            update_recording(sim_state, recording_state)
-            update_viewer(sim_state, viewer)
             
-            # Add a small sleep to prevent the simulation from running too fast
+            # Update recording if needed
+            update_recording(sim_state, recording_state)
+            
+            # Render the viewer
             if viewer is not None:
-                time.sleep(0.001)  # Small sleep to allow GUI to update
+                if not viewer.is_alive:
+                    print("Viewer window was closed.")
+                    break
+                viewer.render()
+            
+            # Small sleep to prevent CPU overload
+            time.sleep(0.001)
+            
     except KeyboardInterrupt:
         print("\nSimulation interrupted by user.")
     finally:
@@ -1157,8 +1184,15 @@ def main() -> None:
 if __name__ == "__main__":
     # Print MuJoCo version information
     try:
+        import mujoco
         print(f"MuJoCo version: {mujoco.__version__}")
-        print(f"Available rendering backends: {mujoco.get_available_plugins()}")
+        
+        # Try to get available plugins if the method exists
+        if hasattr(mujoco, 'get_available_plugins'):
+            try:
+                print(f"Available rendering backends: {mujoco.get_available_plugins()}")
+            except Exception as e:
+                print(f"Error getting available plugins: {str(e)}")
     except Exception as e:
         print(f"Error getting MuJoCo info: {str(e)}")
         
