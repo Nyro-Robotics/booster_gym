@@ -6,4 +6,4 @@ attrs
 mujoco-python-viewer
 opencv-python
 tqdm
-abc
+pygame

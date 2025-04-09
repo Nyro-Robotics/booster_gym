@@ -771,38 +771,42 @@ def update_viewer(sim_state: SimulationState, viewer: Optional[mujoco_viewer.Muj
         viewer: MuJoCo viewer object
     """
     if viewer is not None:
-        # Set camera lookat to follow the robot
-        robot_pos = sim_state.mj_data.qpos.astype(np.float32)[0:3]
-        viewer.cam.lookat[:] = robot_pos
-        
-        # Render the scene normally
-        viewer.render()
-        
-        # Add command text overlay using MuJoCo's native text rendering
-        command_text = f"x={sim_state.lin_vel_x:.2f}, y={sim_state.lin_vel_y:.2f}, yaw={sim_state.ang_vel_yaw:.2f}"
-        
-        # Add text overlay if the viewer supports it
-        if hasattr(viewer, 'add_overlay'):
-            # Some viewers might have a built-in method
-            viewer.add_overlay(mujoco.mjtFont.mjFONT_NORMAL, mujoco.mjtGridPos.mjGRID_TOPRIGHT, command_text)
-        elif hasattr(viewer, 'ctx') and hasattr(viewer, 'viewport'):
-            # Try using MuJoCo's overlay function directly
-            mujoco.mjr_overlay(
-                mujoco.mjtFont.mjFONT_NORMAL,
-                mujoco.mjtGridPos.mjGRID_TOPRIGHT,
-                viewer.viewport,
-                command_text,
-                "",
-                viewer.ctx
-            )
+        try:
+            # Set camera lookat to follow the robot
+            robot_pos = sim_state.mj_data.qpos.astype(np.float32)[0:3]
+            viewer.cam.lookat[:] = robot_pos
             
-            # If the viewer uses GLFW, we might need to swap buffers manually
-            if hasattr(viewer, 'window') and viewer.window is not None:
-                try:
-                    import glfw
-                    glfw.swap_buffers(viewer.window)
-                except (ImportError, AttributeError):
-                    pass  # GLFW not available or not needed
+            # Render the scene normally
+            viewer.render()
+            
+            # Add command text overlay using MuJoCo's native text rendering
+            command_text = f"x={sim_state.lin_vel_x:.2f}, y={sim_state.lin_vel_y:.2f}, yaw={sim_state.ang_vel_yaw:.2f}"
+            
+            # Add text overlay if the viewer supports it
+            if hasattr(viewer, 'add_overlay'):
+                # Some viewers might have a built-in method
+                viewer.add_overlay(mujoco.mjtFont.mjFONT_NORMAL, mujoco.mjtGridPos.mjGRID_TOPRIGHT, command_text)
+            elif hasattr(viewer, 'ctx') and hasattr(viewer, 'viewport'):
+                # Try using MuJoCo's overlay function directly
+                mujoco.mjr_overlay(
+                    mujoco.mjtFont.mjFONT_NORMAL,
+                    mujoco.mjtGridPos.mjGRID_TOPRIGHT,
+                    viewer.viewport,
+                    command_text,
+                    "",
+                    viewer.ctx
+                )
+                
+                # If the viewer uses GLFW, we might need to swap buffers manually
+                if hasattr(viewer, 'window') and viewer.window is not None:
+                    try:
+                        import glfw
+                        glfw.swap_buffers(viewer.window)
+                    except (ImportError, AttributeError):
+                        pass  # GLFW not available or not needed
+        except Exception as e:
+            print(f"Error updating viewer: {str(e)}")
+            # Continue without crashing the simulation
 
 
 def update_recording(sim_state: SimulationState, recording_state: RecordingState) -> None:
@@ -947,9 +951,16 @@ def initialize_simulation(cfg: Dict[str, Any], args: argparse.Namespace) -> Tupl
     )
     
     # Create the viewer object using mujoco_viewer for interactive display
-    viewer = None if args.headless or args.headless_record else mujoco_viewer.MujocoViewer(
-        mj_model, mj_data, width=recording_state.width, height=recording_state.height
-    )
+    viewer = None
+    if not (args.headless or args.headless_record):
+        try:
+            viewer = mujoco_viewer.MujocoViewer(
+                mj_model, mj_data, width=recording_state.width, height=recording_state.height
+            )
+            print("MuJoCo viewer initialized successfully.")
+        except Exception as e:
+            print(f"Error initializing MuJoCo viewer: {str(e)}")
+            print("Falling back to headless mode.")
     
     # Apply camera settings from config
     if viewer:
@@ -1062,6 +1073,11 @@ def main() -> None:
     # Main simulation loop
     running = True
     while running and ((viewer is None) or (viewer is not None and viewer.is_alive)):
+        # Check if window was closed by user
+        if viewer is not None and not viewer.is_alive:
+            print("Viewer window was closed.")
+            break
+        
         # Process user input
         running = control_interface.process_input(sim_state, recording_state, cfg, args)
         if not running:
@@ -1094,4 +1110,11 @@ def main() -> None:
 
 
 if __name__ == "__main__":
+    # Print MuJoCo version information
+    try:
+        print(f"MuJoCo version: {mujoco.__version__}")
+        print(f"Available rendering backends: {mujoco.get_available_plugins()}")
+    except Exception as e:
+        print(f"Error getting MuJoCo info: {str(e)}")
+        
     main()
