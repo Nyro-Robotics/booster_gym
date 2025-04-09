@@ -764,49 +764,26 @@ def step_simulation(sim_state: SimulationState, cfg: Dict[str, Any], normalizati
 
 
 def update_viewer(sim_state: SimulationState, viewer: Optional[mujoco_viewer.MujocoViewer]) -> None:
-    """Update the viewer with the current simulation state.
-    
-    Args:
-        sim_state: Current simulation state
-        viewer: MuJoCo viewer object
-    """
+    """Update the viewer with the current simulation state."""
     if viewer is not None:
         try:
             # Set camera lookat to follow the robot
             robot_pos = sim_state.mj_data.qpos.astype(np.float32)[0:3]
             viewer.cam.lookat[:] = robot_pos
             
-            # Render the scene normally
+            # Force synchronization with the simulation state
+            viewer.sync()
+            
+            # Render the scene
             viewer.render()
             
-            # Add command text overlay using MuJoCo's native text rendering
+            # Add command text overlay
             command_text = f"x={sim_state.lin_vel_x:.2f}, y={sim_state.lin_vel_y:.2f}, yaw={sim_state.ang_vel_yaw:.2f}"
-            
-            # Add text overlay if the viewer supports it
             if hasattr(viewer, 'add_overlay'):
-                # Some viewers might have a built-in method
                 viewer.add_overlay(mujoco.mjtFont.mjFONT_NORMAL, mujoco.mjtGridPos.mjGRID_TOPRIGHT, command_text)
-            elif hasattr(viewer, 'ctx') and hasattr(viewer, 'viewport'):
-                # Try using MuJoCo's overlay function directly
-                mujoco.mjr_overlay(
-                    mujoco.mjtFont.mjFONT_NORMAL,
-                    mujoco.mjtGridPos.mjGRID_TOPRIGHT,
-                    viewer.viewport,
-                    command_text,
-                    "",
-                    viewer.ctx
-                )
                 
-                # If the viewer uses GLFW, we might need to swap buffers manually
-                if hasattr(viewer, 'window') and viewer.window is not None:
-                    try:
-                        import glfw
-                        glfw.swap_buffers(viewer.window)
-                    except (ImportError, AttributeError):
-                        pass  # GLFW not available or not needed
         except Exception as e:
             print(f"Error updating viewer: {str(e)}")
-            # Continue without crashing the simulation
 
 
 def update_recording(sim_state: SimulationState, recording_state: RecordingState) -> None:
@@ -954,15 +931,46 @@ def initialize_simulation(cfg: Dict[str, Any], args: argparse.Namespace) -> Tupl
     viewer = None
     if not (args.headless or args.headless_record):
         try:
-            viewer = mujoco_viewer.MujocoViewer(
-                mj_model, mj_data, width=recording_state.width, height=recording_state.height
-            )
-            # Make sure the viewer is properly initialized
-            viewer.render()
-            print("MuJoCo viewer initialized successfully.")
+            # Try different rendering backends
+            backends_to_try = ['glfw', 'egl', 'osmesa']
+            
+            for backend in backends_to_try:
+                try:
+                    # Set the rendering backend
+                    print(f"Trying MuJoCo rendering backend: {backend}")
+                    os.environ['MUJOCO_GL'] = backend
+                    
+                    # Create the viewer with the current backend
+                    viewer = mujoco_viewer.MujocoViewer(
+                        mj_model, mj_data, 
+                        width=recording_state.width, 
+                        height=recording_state.height,
+                        # Force window mode instead of offscreen
+                        mode='window'
+                    )
+                    
+                    # Test if the viewer works by rendering a frame
+                    viewer.render()
+                    
+                    # If we get here without an exception, the viewer is working
+                    print(f"MuJoCo viewer initialized successfully with backend: {backend}")
+                    break
+                except Exception as backend_error:
+                    print(f"Backend {backend} failed: {str(backend_error)}")
+                    if viewer is not None:
+                        try:
+                            viewer.close()
+                        except:
+                            pass
+                        viewer = None
+            
+            if viewer is None:
+                raise RuntimeError("All rendering backends failed")
+                
         except Exception as e:
             print(f"Error initializing MuJoCo viewer: {str(e)}")
             print("Falling back to headless mode.")
+            args.headless = True
     
     # Apply camera settings from config
     if viewer:
@@ -980,11 +988,39 @@ def initialize_simulation(cfg: Dict[str, Any], args: argparse.Namespace) -> Tupl
     return sim_state, recording_state, rendering_config, viewer
 
 
+def check_mujoco_installation():
+    """Check MuJoCo installation and available rendering backends."""
+    try:
+        import mujoco
+        print(f"MuJoCo version: {mujoco.__version__}")
+        
+        available_plugins = mujoco.get_available_plugins()
+        print(f"Available rendering backends: {available_plugins}")
+        
+        if not available_plugins:
+            print("WARNING: No rendering backends available. You may need to install additional libraries.")
+            print("For Ubuntu/Debian: sudo apt-get install -y libgl1-mesa-dev libgl1-mesa-glx libosmesa6-dev libglew-dev libglfw3-dev")
+            print("For MacOS: brew install glfw glew mesalib-glw")
+        
+        return True
+    except ImportError:
+        print("ERROR: MuJoCo is not installed or not properly configured.")
+        return False
+    except Exception as e:
+        print(f"ERROR checking MuJoCo installation: {str(e)}")
+        return False
+
+
 def main() -> None:
     """Main function to run the simulation.
     
     Handles command-line arguments, configuration loading, and the main simulation loop.
     """
+    # Check MuJoCo installation first
+    if not check_mujoco_installation():
+        print("Cannot continue due to MuJoCo installation issues.")
+        return
+        
     # This needs to be called before any other multiprocessing code
     mp.set_start_method('spawn', force=True)
     
