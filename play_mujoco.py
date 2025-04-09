@@ -950,79 +950,13 @@ def initialize_simulation(cfg: Dict[str, Any], args: argparse.Namespace) -> Tupl
     return sim_state, recording_state, rendering_config, viewer
 
 
-def check_mujoco_installation():
-    """Check MuJoCo installation and available rendering backends."""
-    try:
-        import mujoco
-        print(f"MuJoCo version: {mujoco.__version__}")
-        
-        # Try to get available plugins - this might not be available in all versions
-        try:
-            if hasattr(mujoco, 'get_available_plugins'):
-                available_plugins = mujoco.get_available_plugins()
-                print(f"Available rendering backends: {available_plugins}")
-                
-                if not available_plugins:
-                    print("WARNING: No rendering backends available. You may need to install additional libraries.")
-            else:
-                # For MuJoCo versions that don't have get_available_plugins
-                print("MuJoCo version doesn't provide get_available_plugins method.")
-                print("Will try different rendering backends automatically.")
-        except Exception as plugin_error:
-            print(f"Could not check available plugins: {plugin_error}")
-            
-        # Suggest installation of libraries regardless
-        print("For Ubuntu/Debian: sudo apt-get install -y libgl1-mesa-dev libgl1-mesa-glx libosmesa6-dev libglew-dev libglfw3-dev")
-        print("For MacOS: brew install glfw glew mesalib-glw")
-        
-        return True
-    except ImportError:
-        print("ERROR: MuJoCo is not installed or not properly configured.")
-        return False
-    except Exception as e:
-        print(f"ERROR checking MuJoCo installation: {str(e)}")
-        return False
-
-
-def check_gl_libraries():
-    """Check if OpenGL libraries are properly installed."""
-    try:
-        import ctypes
-        try:
-            # Try to load OpenGL library
-            ctypes.cdll.LoadLibrary('libGL.so.1')
-            print("OpenGL library found.")
-        except OSError:
-            print("WARNING: Could not load OpenGL library.")
-        
-        try:
-            # Try to load GLFW library
-            ctypes.cdll.LoadLibrary('libglfw.so.3')
-            print("GLFW library found.")
-        except OSError:
-            print("WARNING: Could not load GLFW library.")
-            
-        return True
-    except Exception as e:
-        print(f"Error checking GL libraries: {str(e)}")
-        return False
-
-
 def main() -> None:
     """Main function to run the simulation.
     
     Handles command-line arguments, configuration loading, and the main simulation loop.
     """
-    # Check MuJoCo installation first
-    if not check_mujoco_installation():
-        print("Cannot continue due to MuJoCo installation issues.")
-        return
-        
     # This needs to be called before any other multiprocessing code
     mp.set_start_method('spawn', force=True)
-    
-    # Check OpenGL libraries
-    check_gl_libraries()
     
     parser = argparse.ArgumentParser()
     parser.add_argument("--task", required=True, type=str, help="Name of the task to run.")
@@ -1117,8 +1051,46 @@ def main() -> None:
             
             # Define a callback function for the viewer
             def simulation_callback(model, data):
-                # Process user input (simplified for viewer mode)
                 nonlocal running
+                nonlocal sim_state
+                nonlocal recording_state
+                
+                # Process keyboard input if available
+                if select.select([sys.stdin], [], [], 0)[0]:
+                    try:
+                        input_str = sys.stdin.readline().strip()
+                        if input_str == "q":
+                            running = False
+                            return False  # Stop the viewer
+                        elif input_str == "r":
+                            control_interface.start_recording(recording_state)
+                        elif input_str == "s":
+                            control_interface.stop_recording(recording_state, sim_state.mj_model.opt.timestep, cfg, args)
+                        elif len(input_str.split()) == 3:
+                            sim_state.lin_vel_x, sim_state.lin_vel_y, sim_state.ang_vel_yaw = map(float, input_str.split())
+                            print(f"Updated command to: x={sim_state.lin_vel_x}, y={sim_state.lin_vel_y}, yaw={sim_state.ang_vel_yaw}")
+                    except ValueError:
+                        print("Invalid input. Enter three numeric values or r/s/q.")
+                
+                # Process joystick input if available
+                if isinstance(control_interface, JoystickControl) and control_interface.joystick is not None:
+                    pygame.event.pump()
+                    new_lin_vel_x, new_lin_vel_y, new_ang_vel_yaw, button_states = control_interface.get_joystick_input()
+                    
+                    # Update velocities with smoothing
+                    smoothing = 0.2
+                    sim_state.lin_vel_x = sim_state.lin_vel_x * (1 - smoothing) + new_lin_vel_x * smoothing
+                    sim_state.lin_vel_y = sim_state.lin_vel_y * (1 - smoothing) + new_lin_vel_y * smoothing
+                    sim_state.ang_vel_yaw = sim_state.ang_vel_yaw * (1 - smoothing) + new_ang_vel_yaw * smoothing
+                    
+                    # Process button presses
+                    if button_states['record'] and not recording_state.headless_recording:
+                        control_interface.start_recording(recording_state)
+                    elif button_states['stop'] and recording_state.headless_recording:
+                        control_interface.stop_recording(recording_state, sim_state.mj_model.opt.timestep, cfg, args)
+                    elif button_states['quit']:
+                        running = False
+                        return False  # Stop the viewer
                 
                 # Update gait frequency
                 update_gait_frequency(
@@ -1134,11 +1106,16 @@ def main() -> None:
                 # Update recording if needed
                 update_recording(sim_state, recording_state)
                 
+                # Display command info occasionally
+                if sim_state.iteration % 100 == 0:
+                    print(f"\rCommand: x={sim_state.lin_vel_x:.2f}, y={sim_state.lin_vel_y:.2f}, yaw={sim_state.ang_vel_yaw:.2f}", end='')
+                
                 # Return True to continue, False to stop
                 return running
             
             # Launch the viewer with our callback
-            viewer.launch(sim_state.mj_model, sim_state.mj_data, callback=simulation_callback)
+            # Set key_callback=None to prevent the viewer from handling keyboard input itself
+            viewer.launch(sim_state.mj_model, sim_state.mj_data, callback=simulation_callback, key_callback=None)
             print("Viewer closed.")
         else:
             # Regular headless loop
