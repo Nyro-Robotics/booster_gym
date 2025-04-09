@@ -2,3 +2,8 @@ tensorboard
 wandb
 imageio[ffmpeg]
 mujoco
+attrs
+mujoco-python-viewer
+opencv-python
+tqdm
+abc
