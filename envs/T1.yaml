@@ -114,19 +114,29 @@ init_state:
     Right_Ankle_Pitch: {"max": 20, "min": -50}
     Right_Ankle_Roll: {"max": 25, "min": -25}
   lower_body_joints:
-    17: Waist
-    18: Left_Hip_Pitch
-    19: Left_Hip_Roll
-    20: Left_Hip_Yaw
-    21: Left_Knee_Pitch
-    22: Left_Ankle_Pitch
-    23: Left_Ankle_Roll
-    24: Right_Hip_Pitch
-    25: Right_Hip_Roll
-    26: Right_Hip_Yaw
-    27: Right_Knee_Pitch
-    28: Right_Ankle_Pitch
-    29: Right_Ankle_Roll
+    11: Waist
+    12: Left_Hip_Pitch
+    13: Left_Hip_Roll
+    14: Left_Hip_Yaw
+    15: Left_Knee_Pitch
+    16: Left_Ankle_Pitch
+    17: Left_Ankle_Roll
+    18: Right_Hip_Pitch
+    19: Right_Hip_Roll
+    20: Right_Hip_Yaw
+    21: Right_Knee_Pitch
+    22: Right_Ankle_Pitch
+    23: Right_Ankle_Roll
+  left_arm_joints:
+    3: Left_Shoulder_Pitch
+    4: Left_Shoulder_Roll
+    5: Left_Elbow_Pitch
+    6: Left_Elbow_Yaw
+  right_arm_joints:
+    7: Right_Shoulder_Pitch
+    8: Right_Shoulder_Roll
+    9: Right_Elbow_Pitch
+    10: Right_Elbow_Yaw
 
 control:
   stiffness: {"Hip": 200., "Knee": 200., "Ankle": 50.} # [N*m/rad]

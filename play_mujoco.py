@@ -6,7 +6,7 @@ This module provides functionality for:
 - Recording videos in both interactive and headless modes
 - Parallel rendering of frames for efficient video creation
 
-python play_mujoco.py --task=T1 --checkpoint=-1 --fps=30 --headless_record
+python play_mujoco.py --task=T1 --checkpoint=-1 --fps=24 --output T1_simulation.mp4 --headless_record
 """
 
 import os
@@ -939,22 +939,7 @@ def initialize_simulation(cfg: Dict[str, Any], args: argparse.Namespace) -> Tupl
     # Create the viewer object using MuJoCo's built-in viewer
     use_viewer = False  # Flag to indicate if we should use the viewer
     
-    # If headless_record is True, also set headless to True
-    if args.headless_record:
-        args.headless = True
-    
-    if not args.headless:
-        try:
-            # We'll use the built-in viewer in the main loop
-            use_viewer = True  # Just a flag to indicate we want to use the viewer
-        except Exception as e:
-            print(f"Error preparing for MuJoCo viewer: {str(e)}")
-            print("Falling back to headless mode.")
-            args.headless = True
-    else:
-        print("Rendering headless")
-    
-    return sim_state, recording_state, rendering_config, use_viewer
+    return sim_state, recording_state, rendering_config, not args.headless_record
 
 
 def main() -> None:
@@ -969,7 +954,6 @@ def main() -> None:
     parser.add_argument("--task", required=True, type=str, help="Name of the task to run.")
     parser.add_argument("--checkpoint", type=str, help="Path of model checkpoint to load. Overrides config file if provided.")
     parser.add_argument("--headless_record", action="store_true", help="Record in headless mode (no viewer, batch render at end).")
-    parser.add_argument("--headless", action="store_true", help="Run in headless mode without a viewer.")
     parser.add_argument("--output", type=str, default="simulation_video.mp4", help="Output video file name.")
     parser.add_argument("--fps", type=int, default=None, help="Frames per second for video recording. If not provided, uses 1/dt from config.")
     parser.add_argument("--max_frames", type=int, default=10000, help="Maximum number of frames to store in headless mode.")
@@ -988,12 +972,6 @@ def main() -> None:
     
     if args.checkpoint is not None:
         cfg["basic"]["checkpoint"] = args.checkpoint
-
-    # Override record setting if specified in config
-    # if cfg["viewer"]["record_video"] and not args.headless_record:
-    #     args.headless_record = True
-    #     args.headless = True  # Also set headless to True
-    #     print("Recording enabled based on config settings")
     
     # Add timestamp to output filename to avoid overwriting
     if args.output:
