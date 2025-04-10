@@ -5,6 +5,8 @@ This module provides functionality for:
 - Interactive control of the robot with joystick/gamepad
 - Recording videos in both interactive and headless modes
 - Parallel rendering of frames for efficient video creation
+
+python play_mujoco.py --task=T1 --checkpoint=-1 --fps=30 --headless_record
 """
 
 import os
@@ -582,7 +584,7 @@ def render_video_from_states(recording_state: RecordingState, dt: float, cfg: Di
             for batch_idx, batch in enumerate(batches):
                 # Call render_batch directly in the main process
                 result = render_batch(
-                    batch, batch_idx, None, cfg["asset"]["mujoco_file"], 
+                    batch, batch_idx, None, cfg["asset"]["mujoco_locomotion_file"], 
                     camera_settings, recording_state.width, recording_state.height
                 )
                 
@@ -606,7 +608,7 @@ def render_video_from_states(recording_state: RecordingState, dt: float, cfg: Di
             for i in range(min(args.render_threads, len(batches))):
                 p = mp.Process(
                     target=render_batch,
-                    args=(batches[next_batch], next_batch, result_queue, cfg["asset"]["mujoco_file"], 
+                    args=(batches[next_batch], next_batch, result_queue, cfg["asset"]["mujoco_locomotion_file"], 
                           camera_settings, recording_state.width, recording_state.height)
                 )
                 active_processes.append((next_batch, p))
@@ -614,7 +616,8 @@ def render_video_from_states(recording_state: RecordingState, dt: float, cfg: Di
                 next_batch += 1
             
             # Process results and start new processes as needed
-            all_frames = {}
+            pending_batches = {}  # Store batches that arrive out of order
+            next_batch_to_write = 0  # Track the next batch index we should write
             
             while completed_batches < len(batches):
                 try:
@@ -624,15 +627,20 @@ def render_video_from_states(recording_state: RecordingState, dt: float, cfg: Di
                     if isinstance(frames, str):  # Error message
                         print(f"\nError in batch {batch_idx}: {frames}")
                     else:
-                        # Store frames
-                        all_frames[batch_idx] = frames
+                        # Store this batch
+                        pending_batches[batch_idx] = frames
                         
-                        # Write frames to video immediately to free memory
-                        for frame in frames:
-                            recording_state.video_writer.write(frame)
-                        
-                        # Free memory
-                        frames = None
+                        # Write batches in order
+                        while next_batch_to_write in pending_batches:
+                            # Get the frames for the next batch
+                            batch_frames = pending_batches.pop(next_batch_to_write)
+                            
+                            # Write frames to video
+                            for frame in batch_frames:
+                                recording_state.video_writer.write(frame)
+                            
+                            # Move to the next batch
+                            next_batch_to_write += 1
                     
                     # Find and remove the completed process
                     for i, (idx, p) in enumerate(active_processes):
@@ -645,7 +653,7 @@ def render_video_from_states(recording_state: RecordingState, dt: float, cfg: Di
                     if next_batch < len(batches):
                         p = mp.Process(
                             target=render_batch,
-                            args=(batches[next_batch], next_batch, result_queue, cfg["asset"]["mujoco_file"], 
+                            args=(batches[next_batch], next_batch, result_queue, cfg["asset"]["mujoco_locomotion_file"], 
                                   camera_settings, recording_state.width, recording_state.height)
                         )
                         active_processes.append((next_batch, p))
@@ -667,6 +675,14 @@ def render_video_from_states(recording_state: RecordingState, dt: float, cfg: Di
                     print(f"\nError: {str(e)}")
                     print(traceback.format_exc())
             
+            # Make sure we write any remaining batches
+            if pending_batches:
+                print(f"Writing {len(pending_batches)} remaining batches...")
+                for batch_idx in sorted(pending_batches.keys()):
+                    batch_frames = pending_batches[batch_idx]
+                    for frame in batch_frames:
+                        recording_state.video_writer.write(frame)
+        
         # Clean up processes
         for idx, p in active_processes:
             if p.is_alive():
@@ -820,7 +836,7 @@ def initialize_simulation(cfg: Dict[str, Any], args: argparse.Namespace) -> Tupl
     model.load_state_dict(model_dict["model"])
 
     # Initialize MuJoCo simulation
-    mj_model = mujoco.MjModel.from_xml_path(cfg["asset"]["mujoco_file"])
+    mj_model = mujoco.MjModel.from_xml_path(cfg["asset"]["mujoco_locomotion_file"])
     mj_model.opt.timestep = cfg["sim"]["dt"]
     mj_data = mujoco.MjData(mj_model)
     mujoco.mj_resetData(mj_model, mj_data)
@@ -917,7 +933,7 @@ def initialize_simulation(cfg: Dict[str, Any], args: argparse.Namespace) -> Tupl
             'azimuth': 0,
             'distance': np.linalg.norm(np.array(camera_pos) - np.array(camera_lookat))
         },
-        mujoco_file=cfg["asset"]["mujoco_file"]
+        mujoco_file=cfg["asset"]["mujoco_locomotion_file"]
     )
     
     # Create the viewer object using MuJoCo's built-in viewer

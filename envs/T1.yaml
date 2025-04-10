@@ -58,7 +58,9 @@ sim:
 
 asset:
   file: "resources/T1/T1_locomotion.urdf"
-  mujoco_file: "resources/T1/T1_locomotion.xml"
+  mujoco_locomotion_file: "resources/T1/T1_locomotion.xml"
+  mujoco_serial_file: "resources/T1/T1_serial.xml"
+  # mujoco_serial_file: "resources/T1/T1_7_dof_arm_serial_with_head_arm.xml"
   name: "T1"
   base_name: "Trunk"
   foot_names: ["left_foot_link", "right_foot_link"]
@@ -87,6 +89,44 @@ init_state:
   lin_vel: [0.0, 0.0, 0.0]  # x,y,z [m/s]
   ang_vel: [0.0, 0.0, 0.0]  # x,y,z [rad/s]
   default_joint_angles: {"Hip_Pitch": -0.2, "Knee_Pitch": 0.4, "Ankle_Pitch": -0.25, "default": 0.} # target angles when action = 0.0
+  default_joint_limits:
+    AAHead_yaw: {"max": 58, "min": -58}
+    Head_pitch: {"max": 47, "min": -18}
+    Left_Shoulder_Pitch: {"max": 68, "min": -188}
+    Left_Shoulder_Roll: {"max": 88, "min": -94}
+    Left_Elbow_Pitch: {"max": 128, "min": -128}
+    Left_Elbow_Yaw: {"max": 2, "min": -120}
+    Right_Shoulder_Pitch: {"max": 68, "min": -188}
+    Right_Shoulder_Roll: {"max": 94, "min": -88}
+    Right_Elbow_Pitch: {"max": 128, "min": -128}
+    Right_Elbow_Yaw: {"max": 120, "min": -2}
+    Waist: {"max": 58, "min": -58}
+    Left_Hip_Pitch: {"max": 90, "min": -103}
+    Left_Hip_Roll: {"max": 90, "min": -11}
+    Left_Hip_Yaw: {"max": 57, "min": -57}
+    Left_Knee_Pitch: {"max": 134, "min": 0}
+    Left_Ankle_Pitch: {"max": 20, "min": -50}
+    Left_Ankle_Roll: {"max": 25, "min": -25}
+    Right_Hip_Pitch: {"max": 90, "min": -103}
+    Right_Hip_Roll: {"max": 11, "min": -90}
+    Right_Hip_Yaw: {"max": 57, "min": -57}
+    Right_Knee_Pitch: {"max": 134, "min": 0}
+    Right_Ankle_Pitch: {"max": 20, "min": -50}
+    Right_Ankle_Roll: {"max": 25, "min": -25}
+  lower_body_joints:
+    17: Waist
+    18: Left_Hip_Pitch
+    19: Left_Hip_Roll
+    20: Left_Hip_Yaw
+    21: Left_Knee_Pitch
+    22: Left_Ankle_Pitch
+    23: Left_Ankle_Roll
+    24: Right_Hip_Pitch
+    25: Right_Hip_Roll
+    26: Right_Hip_Yaw
+    27: Right_Knee_Pitch
+    28: Right_Ankle_Pitch
+    29: Right_Ankle_Roll
 
 control:
   stiffness: {"Hip": 200., "Knee": 200., "Ankle": 50.} # [N*m/rad]

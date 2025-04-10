@@ -9,6 +9,7 @@
 *.flv
 *.webm
 
+*.TXT
 logs/
 videos/
 *__pycache__/
