@@ -101,18 +101,18 @@ init_state:
     Right_Elbow_Pitch: {"max": 128, "min": -128}
     Right_Elbow_Yaw: {"max": 120, "min": -2}
     Waist: {"max": 58, "min": -58}
-    Left_Hip_Pitch: {"max": 90, "min": -103}
-    Left_Hip_Roll: {"max": 90, "min": -11}
-    Left_Hip_Yaw: {"max": 57, "min": -57}
-    Left_Knee_Pitch: {"max": 134, "min": 0}
-    Left_Ankle_Pitch: {"max": 20, "min": -50}
-    Left_Ankle_Roll: {"max": 25, "min": -25}
-    Right_Hip_Pitch: {"max": 90, "min": -103}
-    Right_Hip_Roll: {"max": 11, "min": -90}
-    Right_Hip_Yaw: {"max": 57, "min": -57}
-    Right_Knee_Pitch: {"max": 134, "min": 0}
-    Right_Ankle_Pitch: {"max": 20, "min": -50}
-    Right_Ankle_Roll: {"max": 25, "min": -25}
+    Left_Hip_Pitch: {"max": 118, "min": -118}
+    Left_Hip_Roll: {"max": 88, "min": -21}
+    Left_Hip_Yaw: {"max": 58, "min": -58}
+    Left_Knee_Pitch: {"max": 123, "min": -11}
+    Left_Ankle_Pitch: {"max": 49, "min": -23}
+    Left_Ankle_Roll: {"max": 45, "min": -24}
+    Right_Hip_Pitch: {"max": 118, "min": -118}
+    Right_Hip_Roll: {"max": 21, "min": -88}
+    Right_Hip_Yaw: {"max": 58, "min": -58}
+    Right_Knee_Pitch: {"max": 123, "min": -11}
+    Right_Ankle_Pitch: {"max": 49, "min": -23}
+    Right_Ankle_Roll: {"max": 45, "min": -24}
   lower_body_joints:
     11: Waist
     12: Left_Hip_Pitch

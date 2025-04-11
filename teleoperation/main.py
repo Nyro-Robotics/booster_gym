@@ -24,7 +24,8 @@ from mujoco import viewer
 import cv2
 import glfw
 
-from teleoperation.utils import initialize_robot_from_config, initialize_robot_state, quat_rotate
+from teleoperation.record import RecordingState
+from teleoperation.utils import initialize_robot_from_config, initialize_robot_state, quat_rotate, setup_viewer
 from teleoperation.teleop_types import RobotState
 from teleoperation.teleop_ik import IKSolver
 
@@ -204,96 +205,6 @@ class UserInterface:
                 print(f"\rRight hand: {right_pos.round(3)} → {right_target.round(3)} (dist: {right_dist:.3f})", end="")
 
 @attrs.define
-class RecordingState:
-    """Class to hold the state of video recording."""
-    recording: bool = False
-    frames: List[np.ndarray] = attrs.Factory(list)
-    output_path: str = "robot_episode.webm"  # Changed to WebM format
-    fps: int = 30
-    width: int = 640
-    height: int = 480
-    
-    def __attrs_post_init__(self):
-        # Ensure width and height are reasonable
-        if self.width < 320:
-            self.width = 320
-        if self.height < 240:
-            self.height = 240
-        
-        # Ensure output path has .webm extension
-        if not self.output_path.endswith('.webm'):
-            base_name = os.path.splitext(self.output_path)[0]
-            self.output_path = f"{base_name}.webm"
-    
-    def start_recording(self) -> None:
-        """Start recording frames."""
-        self.recording = True
-        self.frames = []
-        print(f"Recording started. Frames will be stored for video creation.")
-    
-    def stop_recording(self) -> None:
-        """Stop recording and save the video."""
-        if not self.recording:
-            print("Not recording.")
-            return
-        
-        self.recording = False
-        if not self.frames:
-            print("No frames recorded.")
-            return
-        
-        try:
-            import cv2
-            # Use VP8 codec for WebM format
-            fourcc = cv2.VideoWriter_fourcc(*'VP80')
-            
-            # Get dimensions from the first frame
-            if self.frames:
-                h, w = self.frames[0].shape[:2]
-                if h != self.height or w != self.width:
-                    print(f"Adjusting video dimensions to match frames: {w}x{h}")
-                    self.width, self.height = w, h
-            
-            video_writer = cv2.VideoWriter(
-                self.output_path, 
-                fourcc, 
-                self.fps, 
-                (self.width, self.height)
-            )
-            
-            if not video_writer.isOpened():
-                print(f"Error: Could not create video writer for {self.output_path}")
-                # Try with a different codec as fallback
-                print("Trying with MP4V codec instead...")
-                fallback_path = os.path.splitext(self.output_path)[0] + ".mp4"
-                video_writer = cv2.VideoWriter(
-                    fallback_path,
-                    cv2.VideoWriter_fourcc(*'mp4v'),
-                    self.fps,
-                    (self.width, self.height)
-                )
-                
-                if not video_writer.isOpened():
-                    print(f"Error: Could not create video writer with fallback codec")
-                    return
-                else:
-                    self.output_path = fallback_path
-            
-            print(f"Saving {len(self.frames)} frames to {self.output_path}...")
-            for frame in self.frames:
-                video_writer.write(frame)
-            
-            video_writer.release()
-            print(f"Video saved to {self.output_path}")
-        except Exception as e:
-            print(f"Error saving video: {e}")
-            import traceback
-            traceback.print_exc()
-            raise e
-        
-        self.frames = []
-
-@attrs.define
 class HeadlessInterface:
     """Terminal interface for controlling the robot in headless mode."""
     robot_state: RobotState
@@ -323,10 +234,8 @@ class HeadlessInterface:
         print("  record - Start recording")
         print("  stop - Stop recording")
         print("  status - Show current positions")
-        print("  solve - Solve IK for current targets")
-        print("  solve_left - Solve IK for left hand only")
-        print("  solve_right - Solve IK for right hand only")
-        print("  solve_both - Solve IK for both hands")
+        print("  record_solve_left - Record and solve IK for left hand")
+        print("  record_solve_right - Record and solve IK for right hand")
         print("  run - Run simulation to reach targets")
         print("  quit - Exit the program")
         
@@ -377,35 +286,18 @@ class HeadlessInterface:
                     
                     except ValueError:
                         print("Error: Coordinates must be numbers")
-                
-                elif parts[0] == "solve":
-                    # Solve IK for the active hand
-                    print(f"Solving IK for {self.robot_state.current_mode} hand...")
-                    if self.robot_state.current_mode == "left":
-                        self.ik_solver.solve_ik("left", self.robot_state.target_left_pos)
-                    else:
-                        self.ik_solver.solve_ik("right", self.robot_state.target_right_pos)
+                elif parts[0] == "record_solve_left":
+                    # Record and solve IK for left hand
+                    print("Recording and solving IK for left hand...")
+                    self.ik_solver.solve_ik("left", self.robot_state.target_left_pos, record_convergence=True)
                     self._print_status()
                 
-                elif parts[0] == "solve_left":
-                    # Solve IK for left hand only
-                    print("Solving IK for left hand...")
-                    self.ik_solver.solve_ik("left", self.robot_state.target_left_pos)
+                elif parts[0] == "record_solve_right":
+                    # Record and solve IK for right hand
+                    print("Recording and solving IK for right hand...")
+                    self.ik_solver.solve_ik("right", self.robot_state.target_right_pos, record_convergence=True)
                     self._print_status()
-                
-                elif parts[0] == "solve_right":
-                    # Solve IK for right hand only
-                    print("Solving IK for right hand...")
-                    self.ik_solver.solve_ik("right", self.robot_state.target_right_pos)
-                    self._print_status()
-                
-                elif parts[0] == "solve_both":
-                    # Solve IK for both hands
-                    print("Solving IK for both hands...")
-                    self.ik_solver.solve_ik("left", self.robot_state.target_left_pos)
-                    self.ik_solver.solve_ik("right", self.robot_state.target_right_pos)
-                    self._print_status()
-                
+
                 elif parts[0] == "record":
                     self.recording_state.start_recording()
                 
@@ -520,146 +412,6 @@ class HeadlessInterface:
         
         return head_relative
 
-    # deprecated
-    def render_offscreen(self, model: mujoco.MjModel, data: mujoco.MjData, width: int, height: int,
-                        left_target: np.ndarray, right_target: np.ndarray,
-                        left_hand_id: int, right_hand_id: int) -> np.ndarray:
-        """Render a frame offscreen with target markers using mjr functions."""
-
-        # Initialize GLFW to create an OpenGL context
-        if not glfw.init():
-            print("Could not initialize GLFW")
-            return np.zeros((height, width, 3), dtype=np.uint8)
-
-        # Create a hidden window for the OpenGL context
-        glfw.window_hint(glfw.VISIBLE, glfw.FALSE)
-        window = glfw.create_window(width, height, "Offscreen Rendering", None, None)
-        if not window:
-            glfw.terminate()
-            print("Could not create GLFW window")
-            return np.zeros((height, width, 3), dtype=np.uint8)
-        glfw.make_context_current(window)
-        glfw.swap_interval(0) # Vsync off
-
-        context = None # Initialize context to None for cleanup
-        try:
-            # Create MuJoCo rendering context, scene, camera, options
-            context = mujoco.MjrContext(model, mujoco.mjtFontScale.mjFONTSCALE_150)
-            scene = mujoco.MjvScene(model, maxgeom=1000) # Increase maxgeom if needed
-            camera = mujoco.MjvCamera()
-            opt = mujoco.MjvOption()
-            pert = mujoco.MjvPerturb() # Needed for mjv_updateScene
-
-            # Configure camera (adjust as needed)
-            camera.type = mujoco.mjtCamera.mjCAMERA_FREE
-            camera.distance = 3.5
-            camera.azimuth = 180
-            camera.elevation = -20
-            camera.lookat[:] = np.mean(data.xpos, axis=0) # Look at center of model
-
-            # Update scene data
-            mujoco.mjv_updateScene(
-                model, data, opt, pert, camera,
-                mujoco.mjtCatBit.mjCAT_ALL, scene
-            )
-
-            # --- Add Markers Directly to Scene ---
-            # Get current hand positions
-            left_pos = data.site_xpos[left_hand_id].copy()
-            right_pos = data.site_xpos[right_hand_id].copy()
-
-            markers_to_add = [
-                {"type": mujoco.mjtGeom.mjGEOM_SPHERE, "size": [0.03]*3, "pos": left_target, "rgba": [1, 0, 0, 0.7]},
-                {"type": mujoco.mjtGeom.mjGEOM_SPHERE, "size": [0.03]*3, "pos": right_target, "rgba": [0, 0, 1, 0.7]},
-                {"type": mujoco.mjtGeom.mjGEOM_SPHERE, "size": [0.05]*3, "pos": left_pos, "rgba": [1, 0.5, 0.5, 0.7]},
-                {"type": mujoco.mjtGeom.mjGEOM_SPHERE, "size": [0.05]*3, "pos": right_pos, "rgba": [0.5, 0.5, 1, 0.7]},
-            ]
-
-            for marker in markers_to_add:
-                if scene.ngeom >= scene.maxgeom:
-                    print("Warning: Max geoms reached, skipping marker.")
-                    break
-                g = scene.geoms[scene.ngeom]
-                # Use mjv_initGeom for modern MuJoCo versions if available, otherwise set manually
-                if hasattr(mujoco, 'mjv_initGeom'):
-                    mujoco.mjv_initGeom(
-                        g,
-                        marker.get("type", mujoco.mjtGeom.mjGEOM_SPHERE),
-                        marker.get("size", np.array([0.01, 0.01, 0.01])),
-                        marker.get("pos", np.array([0.0, 0.0, 0.0])),
-                        marker.get("mat", np.eye(3).flatten()),
-                        marker.get("rgba", np.array([1.0, 1.0, 1.0, 1.0])),
-                    )
-                    # Set label separately if needed (mjv_initGeom doesn't handle it)
-                    g.label = marker.get("label", "")
-                else: # Fallback for older MuJoCo versions or manual setting
-                    g.type = marker.get("type", mujoco.mjtGeom.mjGEOM_SPHERE)
-                    g.size[:] = marker.get("size", np.array([0.01, 0.01, 0.01]))
-                    g.pos[:] = marker.get("pos", np.array([0.0, 0.0, 0.0]))
-                    g.mat[:] = marker.get("mat", np.eye(3).flatten())
-                    g.rgba[:] = marker.get("rgba", np.array([1.0, 1.0, 1.0, 1.0]))
-                    g.label = marker.get("label", "")
-                    # Set default values as in ref2.py's legacy function
-                    g.dataid = -1
-                    g.objtype = mujoco.mjtObj.mjOBJ_UNKNOWN
-                    g.objid = -1
-                    g.category = mujoco.mjtCatBit.mjCAT_DECOR
-                    g.texid = -1
-                    g.texuniform = 0
-                    g.texrepeat[0] = 1
-                    g.texrepeat[1] = 1
-                    g.emission = 0
-                    g.specular = 0.5
-                    g.shininess = 0.5
-                    g.reflectance = 0
-
-                scene.ngeom += 1
-            # --- End Marker Addition ---
-
-            # Create viewport
-            viewport = mujoco.MjrRect(0, 0, width, height)
-
-            # Render scene to offscreen buffer
-            mujoco.mjr_setBuffer(mujoco.mjtFramebuffer.mjFB_OFFSCREEN, context)
-            mujoco.mjr_render(viewport, scene, context)
-
-            # Read pixels
-            rgb_arr = np.zeros(3 * viewport.width * viewport.height, dtype=np.uint8)
-            depth_arr = np.zeros(viewport.width * viewport.height, dtype=np.float32) # Need depth buffer for readPixels
-            mujoco.mjr_readPixels(rgb_arr, depth_arr, viewport, context)
-            img = rgb_arr.reshape((height, width, 3))
-            img = np.flipud(img) # Flip vertically
-
-            # Convert to BGR for OpenCV
-            img_bgr = cv2.cvtColor(img, cv2.COLOR_RGB2BGR)
-
-            # Add text overlays using OpenCV
-            font = cv2.FONT_HERSHEY_SIMPLEX
-            font_scale = 0.5
-            thickness = 1
-            left_dist = np.linalg.norm(left_pos - left_target)
-            right_dist = np.linalg.norm(right_pos - right_target)
-            cv2.putText(img_bgr, f"Left distance: {left_dist:.3f}",
-                    (10, 20), font, font_scale, (0, 0, 255), thickness)
-            cv2.putText(img_bgr, f"Right distance: {right_dist:.3f}",
-                    (10, 40), font, font_scale, (255, 0, 0), thickness)
-
-            return img_bgr
-
-        except Exception as e:
-            print(f"Error during offscreen rendering: {e}")
-            import traceback
-            traceback.print_exc()
-            return np.zeros((height, width, 3), dtype=np.uint8)
-
-        finally:
-            # Clean up MuJoCo context and GLFW
-            # The MjrContext (context) should be garbage collected.
-            # We only need to terminate GLFW to release the OpenGL context.
-            # if context:  # No longer needed
-            #     mujoco.mjr_freeContext(context) # Remove this line
-            glfw.terminate()
-
     def headless_simulation_loop(self, robot_state: RobotState, recording_state: RecordingState, 
                                 target_fps: int = 30, duration: float = 5.0) -> None:
         """Run a headless simulation to reach the current targets."""
@@ -671,7 +423,7 @@ class HeadlessInterface:
         total_steps = int(duration / dt)
         
         # Solve IK for both hands to get target joint angles
-        ik_solver = IKSolver(robot_state=robot_state)
+        ik_solver = IKSolver(robot_state=robot_state, recording_state=recording_state)
         
         # Get initial joint angles
         initial_angles = robot_state.get_joint_angles().copy()
@@ -684,18 +436,9 @@ class HeadlessInterface:
         print(f"Initial right hand position: {right_initial}")
         print(f"Target right hand position: {robot_state.target_right_pos}")
         
-        # Use the same joint indices as the IK solver for consistency
-        left_joint_indices = []
-        right_joint_indices = []
-        
-        # Get the same joints that the IK solver uses
-        for name in ["Left_Shoulder_Pitch", "Left_Shoulder_Roll", "Left_Elbow_Pitch", "Left_Elbow_Yaw"]:
-            if name in robot_state.joint_indices:
-                left_joint_indices.append(robot_state.joint_indices[name])
-
-        for name in ["Right_Shoulder_Pitch", "Right_Shoulder_Roll", "Right_Elbow_Pitch", "Right_Elbow_Yaw"]:
-            if name in robot_state.joint_indices:
-                right_joint_indices.append(robot_state.joint_indices[name])
+        # Get the joint indices for both arms
+        left_joint_indices = robot_state.left_arm_joint_indices
+        right_joint_indices = robot_state.right_arm_joint_indices
         
         print(f"Using {len(left_joint_indices)} left arm joints and {len(right_joint_indices)} right arm joints")
         
@@ -713,44 +456,113 @@ class HeadlessInterface:
         # Reset to initial state
         robot_state.set_joint_angles(initial_angles)
         
-        # Use a larger smoothing factor for faster movement in headless mode
-        smoothing_factor = 0.1
+        # PD control parameters
+        kp = 20.0  # Position gain
+        kd = 2.0   # Velocity damping
+        
+        # Start recording if requested
+        if recording_state is not None:
+            recording_state.start_recording()
         
         try:
             # Run simulation
             for step in range(total_steps):
-                # Get current joint positions
+                # Get current joint positions and velocities
                 current_angles = robot_state.mj_data.qpos.copy()
+                current_vels = robot_state.mj_data.qvel.copy()
                 
-                # Create new target angles by blending current and final target
-                new_angles = current_angles.copy()
-                
-                # Update left arm joints
+                # Apply control forces using PD control
                 for i, idx in enumerate(left_joint_indices):
-                    # Apply direct movement without smoothing for testing
-                    if step < total_steps / 2:  # Move more aggressively in first half
-                        new_angles[idx] = left_target_angles[idx]
-                    else:
-                        # Apply smoothing in second half
-                        new_angles[idx] = current_angles[idx] + smoothing_factor * (left_target_angles[idx] - current_angles[idx])
+                    if idx < len(robot_state.mj_data.ctrl):
+                        # Calculate error and derivative terms
+                        pos_error = left_target_angles[idx] - current_angles[idx]
+                        vel_error = -current_vels[idx]  # Damping term
+                        
+                        # PD control law
+                        control_force = kp * pos_error + kd * vel_error
+                        
+                        # Apply control force
+                        robot_state.mj_data.ctrl[idx] = control_force
                 
-                # Update right arm joints
                 for i, idx in enumerate(right_joint_indices):
-                    # Apply direct movement without smoothing for testing
-                    if step < total_steps / 2:  # Move more aggressively in first half
-                        new_angles[idx] = right_target_angles[idx]
-                    else:
-                        # Apply smoothing in second half
-                        new_angles[idx] = current_angles[idx] + smoothing_factor * (right_target_angles[idx] - current_angles[idx])
+                    if idx < len(robot_state.mj_data.ctrl):
+                        # Calculate error and derivative terms
+                        pos_error = right_target_angles[idx] - current_angles[idx]
+                        vel_error = -current_vels[idx]  # Damping term
+                        
+                        # PD control law
+                        control_force = kp * pos_error + kd * vel_error
+                        
+                        # Apply control force
+                        robot_state.mj_data.ctrl[idx] = control_force
                 
-                # Set the joint angles
-                robot_state.mj_data.qpos[:] = new_angles
+                # Step the simulation forward
+                mujoco.mj_step(robot_state.mj_model, robot_state.mj_data)
                 
-                # Zero out velocities for stability
-                robot_state.mj_data.qvel[:] = 0.0
-                
-                # Forward the simulation to update positions
-                mujoco.mj_forward(robot_state.mj_model, robot_state.mj_data)
+                # Capture frame if it's time and we're recording
+                if step % steps_per_frame == 0 and recording_state is not None and recording_state.is_recording:
+                    try:
+                        # Get current hand positions
+                        left_pos = robot_state.get_hand_position("left")
+                        right_pos = robot_state.get_hand_position("right")
+                        
+                        # Create markers for visualization
+                        markers = [
+                            # Left target marker
+                            {
+                                "type": mujoco.mjtGeom.mjGEOM_SPHERE,
+                                "size": np.array([0.03, 0.03, 0.03]),
+                                "pos": robot_state.target_left_pos,
+                                "rgba": np.array([1.0, 0.0, 0.0, 0.7]),
+                                "label": "Left Target"
+                            },
+                            # Right target marker
+                            {
+                                "type": mujoco.mjtGeom.mjGEOM_SPHERE,
+                                "size": np.array([0.03, 0.03, 0.03]),
+                                "pos": robot_state.target_right_pos,
+                                "rgba": np.array([0.0, 0.0, 1.0, 0.7]),
+                                "label": "Right Target"
+                            },
+                            # Left hand marker
+                            {
+                                "type": mujoco.mjtGeom.mjGEOM_SPHERE,
+                                "size": np.array([0.03, 0.03, 0.03]),
+                                "pos": left_pos,
+                                "rgba": np.array([1.0, 0.5, 0.5, 0.7]),
+                                "label": "Left Hand"
+                            },
+                            # Right hand marker
+                            {
+                                "type": mujoco.mjtGeom.mjGEOM_SPHERE,
+                                "size": np.array([0.03, 0.03, 0.03]),
+                                "pos": right_pos,
+                                "rgba": np.array([0.5, 0.5, 1.0, 0.7]),
+                                "label": "Right Hand"
+                            }
+                        ]
+                        
+                        # Capture frame
+                        frame = capture_mujoco_frame(
+                            model=robot_state.mj_model,
+                            data=robot_state.mj_data,
+                            width=recording_state.width,
+                            height=recording_state.height,
+                            text_overlay=[
+                                (f"Simulation Step: {step}/{total_steps}", 
+                                 (10, 30), 0.7, (255, 255, 255), 2),
+                                (f"Left hand distance: {np.linalg.norm(left_pos - robot_state.target_left_pos):.3f}", 
+                                 (10, 60), 0.7, (255, 255, 255), 2),
+                                (f"Right hand distance: {np.linalg.norm(right_pos - robot_state.target_right_pos):.3f}", 
+                                 (10, 90), 0.7, (255, 255, 255), 2)
+                            ],
+                            markers=markers
+                        )
+                        
+                        # Add the frame to the recording
+                        recording_state.frames.append(frame.copy())
+                    except Exception as e:
+                        print(f"Error capturing frame: {e}")
                 
                 # Print progress occasionally
                 if step % 100 == 0 or step == total_steps - 1:
@@ -762,18 +574,20 @@ class HeadlessInterface:
                     print(f"Simulation progress: {progress:.1f}%")
                     print(f"Left hand distance to target: {left_dist:.3f}")
                     print(f"Right hand distance to target: {right_dist:.3f}")
-                    print(f"Current left hand position: {left_pos}")
-                    print(f"Current right hand position: {right_pos}")
                     
                     # Print joint angles for debugging
                     if step == 0 or step == total_steps - 1:
                         print("Joint angles:")
                         for i, idx in enumerate(left_joint_indices):
                             name = [n for n, j in robot_state.joint_indices.items() if j == idx][0]
-                            print(f"  {name}: {np.degrees(new_angles[idx]):.2f}°")
+                            print(f"  {name}: {np.degrees(robot_state.mj_data.qpos[idx]):.2f}°")
             
             print(f"Simulation complete.")
-                
+            
+            # Stop recording if we started it
+            if recording_state is not None and recording_state.is_recording:
+                recording_state.stop_recording()
+            
         except Exception as e:
             print(f"Error during simulation: {e}")
             import traceback
@@ -812,9 +626,6 @@ def main() -> None:
     # Initialize robot state
     robot_state = initialize_robot_state(model, data, joint_config)
     
-    # Create IK solver
-    ik_solver = IKSolver(robot_state=robot_state)
-    
     # Create recording state
     recording_state = RecordingState(
         output_path=args.output,
@@ -833,6 +644,16 @@ def main() -> None:
             recording_state.height = config["recording"]["height"]
         if "output" in config["recording"]:
             recording_state.output_path = config["recording"]["output"]
+    
+    # Create IK solver with recording state
+    ik_solver = IKSolver(robot_state=robot_state, recording_state=recording_state)
+    
+    # Add these lines for debugging
+    print("\n=== DEBUGGING ROBOT MODEL ===")
+    ik_solver.ensure_hand_sites_exist()
+    ik_solver.visualize_robot_structure()
+    ik_solver.verify_joint_limits()
+    print("============================\n")
     
     if args.headless:
         # Create headless interface

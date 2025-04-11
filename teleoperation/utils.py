@@ -69,14 +69,14 @@ def initialize_robot_from_config(config: Dict[str, Any]) -> Tuple[mujoco.MjModel
         if "default_joint_limits" in config["init_state"]:
             joint_config["default_limits"] = config["init_state"]["default_joint_limits"]
             
-            # Apply default joint angles
-            if "default_angles" in joint_config:
-                for i in range(model.nu):
-                    joint_name = mujoco.mj_id2name(model, mujoco.mjtObj.mjOBJ_JOINT, i + 7)  # Skip root joints
-                    if joint_name in joint_config["default_angles"]:
-                        data.qpos[i + 7] = joint_config["default_angles"][joint_name]
-                    elif "default" in joint_config["default_angles"]:
-                        data.qpos[i + 7] = joint_config["default_angles"]["default"]
+            # # Apply default joint angles
+            # if "default_angles" in joint_config:
+            #     for i in range(model.nu):
+            #         joint_name = mujoco.mj_id2name(model, mujoco.mjtObj.mjOBJ_JOINT, i + 7)  # Skip root joints
+            #         if joint_name in joint_config["default_angles"]:
+            #             data.qpos[i + 7] = joint_config["default_angles"][joint_name]
+            #         elif "default" in joint_config["default_angles"]:
+            #             data.qpos[i + 7] = joint_config["default_angles"]["default"]
     
     # Set PD gains if specified
     if "control" in config:
