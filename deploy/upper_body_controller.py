@@ -33,8 +33,8 @@ DEFAULT_WEBSOCKET_URL = "ws://localhost:8765"  # Default WebSocket URL for arm t
 USE_MOCK_TRACKING = True if UPPER_BODY_CONTROL_MODE == "sine" else False  # Whether to use mock sine wave tracking instead of actual VR teleop via WebSocket
 
 # Sine wave control parameters
-SINE_CONTROL_AMPLITUDE = 0.2      # Base amplitude for sine wave movements
-SINE_CONTROL_FREQUENCY = 0.5      # Base frequency for sine wave movements (Hz)
+SINE_CONTROL_AMPLITUDE = 0.15      # Base amplitude for sine wave movements
+SINE_CONTROL_FREQUENCY = 1.5      # Base frequency for sine wave movements (Hz)
 
 class WebSocketArmTrackingClient:
     """WebSocket client for receiving arm tracking commands.
@@ -354,14 +354,13 @@ def main():
 
 if __name__ == "__main__":
     # Debug prints before anything else
-    import sys
-    print("\n\n", flush=True)
-    print("*"*80, flush=True)
-    print("STARTING UPPER BODY CONTROLLER", flush=True)
-    print(f"DEFAULT_CONTROL_MODE = {DEFAULT_CONTROL_MODE}", flush=True)
-    print(f"UPPER_BODY_CONTROL_MODE from deploy.py = {UPPER_BODY_CONTROL_MODE}", flush=True)
-    print("*"*80, flush=True)
-    print("\n\n", flush=True)
+    print("\n\n")
+    print("*"*80)
+    print("STARTING UPPER BODY CONTROLLER")
+    print(f"DEFAULT_CONTROL_MODE = {DEFAULT_CONTROL_MODE}")
+    print(f"UPPER_BODY_CONTROL_MODE from deploy.py = {UPPER_BODY_CONTROL_MODE}")
+    print("*"*80)
+    print("\n\n")
     
     signal.signal(signal.SIGINT, signal_handler)
     main()
