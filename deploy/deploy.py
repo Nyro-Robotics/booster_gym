@@ -27,7 +27,6 @@ from enum import Enum
 # Options: "policy", "teleop", "sine"
 UPPER_BODY_CONTROL_MODE = "sine"  # Default to policy control
 
-
 class BodyPart(Enum):
     LOWER_BODY = 0  # Legs and torso
     UPPER_BODY = 1  # Arms
@@ -186,12 +185,17 @@ class Controller:
 
     def _determine_upper_body_mode(self):
         """Determine the upper body control mode based on global constant"""
+        print(f"\nDEBUG - UPPER_BODY_CONTROL_MODE = {UPPER_BODY_CONTROL_MODE}\n")
+        
         if UPPER_BODY_CONTROL_MODE == "teleop":
+            print("Setting mode to TELEOP")
             return UpperBodyControlMode.TELEOP.value
         elif UPPER_BODY_CONTROL_MODE == "sine":
+            print("Setting mode to SINE")
             return UpperBodyControlMode.SINE.value
         else:
             # Default to policy control for any other value
+            print("Setting mode to POLICY (default)")
             return UpperBodyControlMode.POLICY.value
             
     def set_upper_body_positions(self, positions):

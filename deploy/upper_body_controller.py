@@ -353,5 +353,15 @@ def main():
 
 
 if __name__ == "__main__":
+    # Debug prints before anything else
+    import sys
+    print("\n\n", flush=True)
+    print("*"*80, flush=True)
+    print("STARTING UPPER BODY CONTROLLER", flush=True)
+    print(f"DEFAULT_CONTROL_MODE = {DEFAULT_CONTROL_MODE}", flush=True)
+    print(f"UPPER_BODY_CONTROL_MODE from deploy.py = {UPPER_BODY_CONTROL_MODE}", flush=True)
+    print("*"*80, flush=True)
+    print("\n\n", flush=True)
+    
     signal.signal(signal.SIGINT, signal_handler)
     main()
