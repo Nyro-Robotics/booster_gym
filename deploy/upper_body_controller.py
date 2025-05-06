@@ -184,8 +184,8 @@ class MockArmTrackingSystem:
         # Sine wave parameters
         self.sine_params = {
             "amplitudes": {
-                "head_yaw": SINE_CONTROL_AMPLITUDE * 0.7,      # Head yaw amplitude
-                "head_pitch": SINE_CONTROL_AMPLITUDE * 0.3,    # Head pitch amplitude
+                "head_yaw": SINE_CONTROL_AMPLITUDE * 1.7,      # Head yaw amplitude
+                "head_pitch": SINE_CONTROL_AMPLITUDE * 0.5,    # Head pitch amplitude
                 "left_shoulder_pitch": SINE_CONTROL_AMPLITUDE * 2.0,  # Left shoulder pitch amplitude
                 "left_shoulder_roll": SINE_CONTROL_AMPLITUDE * 0.3,   # Left shoulder roll amplitude
                 "left_shoulder_yaw": SINE_CONTROL_AMPLITUDE * 0.8,    # Left shoulder yaw amplitude
