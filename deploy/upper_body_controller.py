@@ -194,7 +194,7 @@ class MockArmTrackingSystem:
                 "right_shoulder_roll": SINE_CONTROL_AMPLITUDE * 0.3,           # Right shoulder roll amplitude
                 "right_shoulder_yaw": SINE_CONTROL_AMPLITUDE * 0.8,           # Right shoulder yaw amplitude
                 "right_elbow": SINE_CONTROL_AMPLITUDE * 0.7,           # Right elbow amplitude
-                "waist": SINE_CONTROL_AMPLITUDE * 1.0,         # Waist amplitude (disabled)
+                "waist": SINE_CONTROL_AMPLITUDE * 3.0,         # Waist amplitude (disabled)
             },
             "frequencies": {
                 "head_yaw": SINE_CONTROL_FREQUENCY * 0.7,       # Head yaw frequency (Hz)
