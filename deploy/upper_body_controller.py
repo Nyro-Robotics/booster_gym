@@ -199,6 +199,27 @@ class WebSocketArmTrackingClient:
             self.ws_thread.join(timeout=1.0)
         self.connected = False
     
+    def send_joint_positions(self, positions):
+        """Send joint positions back through the websocket.
+        
+        Args:
+            positions: Array of joint positions for upper body joints
+        """
+        if self.connected and self.ws is not None and self.ws.sock is not None:
+            try:
+                # Create a JSON message with the current joint positions
+                pos_list = positions.tolist()
+                message = json.dumps({
+                    "observed_joint_positions": pos_list
+                })
+                
+                # Debug print to verify positions and array length
+                print(f"Streaming joint positions (length: {len(pos_list)}):\n{pos_list}")
+                
+                self.ws.send(message)
+            except Exception as e:
+                print(f"Error sending joint positions: {e}")
+    
     def get_joint_positions(self):
         """Get the current joint positions.
         
@@ -215,6 +236,9 @@ class WebSocketArmTrackingClient:
                 if i in self.joint_limits:
                     min_val, max_val = self.joint_limits[i]
                     positions[i] = np.clip(positions[i], min_val, max_val)
+            
+            # Stream the positions back through the websocket
+            self.send_joint_positions(positions)
             
             return positions
 
