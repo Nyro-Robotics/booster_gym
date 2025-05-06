@@ -175,8 +175,8 @@ class MockArmTrackingSystem:
                 # Fallback to hardcoded defaults
                 self.default_positions = np.array([0, 0, 0.2, -1.35, 0, -0.5, 0.2, 1.35, 0, 0.5, 0])
         else:
-            # Use hardcoded defaults if no config provided
-            self.default_positions = np.array([0, 0, 0.2, -1.35, 0, -0.5, 0.2, 1.35, 0, 0.5, 0])
+            # Raise error
+            raise ValueError("No config provided and could not find default_qpos in config")
         
         # Initialize with default positions
         self.joint_positions = np.copy(self.default_positions)
@@ -186,16 +186,28 @@ class MockArmTrackingSystem:
             "amplitudes": {
                 "head_yaw": SINE_CONTROL_AMPLITUDE * 0.7,      # Head yaw amplitude
                 "head_pitch": SINE_CONTROL_AMPLITUDE * 0.3,    # Head pitch amplitude
-                "left_arm": SINE_CONTROL_AMPLITUDE,            # Left arm amplitude
-                "right_arm": SINE_CONTROL_AMPLITUDE,           # Right arm amplitude
-                "waist": SINE_CONTROL_AMPLITUDE * 0.0,         # Waist amplitude (disabled)
+                "left_shoulder_pitch": SINE_CONTROL_AMPLITUDE * 2.0,  # Left shoulder pitch amplitude
+                "left_shoulder_roll": SINE_CONTROL_AMPLITUDE * 0.2,   # Left shoulder roll amplitude
+                "left_shoulder_yaw": SINE_CONTROL_AMPLITUDE * 0.6,    # Left shoulder yaw amplitude
+                "left_elbow": SINE_CONTROL_AMPLITUDE * 0.7,           # Left elbow amplitude
+                "right_shoulder_pitch": SINE_CONTROL_AMPLITUDE   * 1.0,           # Right arm amplitude
+                "right_shoulder_roll": SINE_CONTROL_AMPLITUDE * 0.2,           # Right arm amplitude
+                "right_shoulder_yaw": SINE_CONTROL_AMPLITUDE * 0.6,           # Right arm amplitude
+                "right_elbow": SINE_CONTROL_AMPLITUDE * 0.7,           # Right arm amplitude
+                "waist": SINE_CONTROL_AMPLITUDE * 0.5,         # Waist amplitude (disabled)
             },
             "frequencies": {
                 "head_yaw": SINE_CONTROL_FREQUENCY * 0.7,       # Head yaw frequency (Hz)
                 "head_pitch": SINE_CONTROL_FREQUENCY * 0.5,     # Head pitch frequency (Hz)
-                "left_arm": SINE_CONTROL_FREQUENCY,             # Left arm frequency (Hz)
-                "right_arm": SINE_CONTROL_FREQUENCY,            # Right arm frequency (Hz)
-                "waist": SINE_CONTROL_FREQUENCY * 0.3,          # Waist frequency (Hz)
+                "left_shoulder_pitch": SINE_CONTROL_FREQUENCY * 1.0,  # Left arm frequency (Hz)
+                "left_shoulder_roll": SINE_CONTROL_FREQUENCY * 0.8,   # Right arm frequency (Hz)
+                "left_shoulder_yaw": SINE_CONTROL_FREQUENCY * 0.6,    # Waist frequency (Hz)
+                "left_elbow": SINE_CONTROL_FREQUENCY * 0.7,           # Left elbow frequency (Hz)
+                "right_shoulder_pitch": SINE_CONTROL_FREQUENCY * 1.0,  # Left arm frequency (Hz)
+                "right_shoulder_roll": SINE_CONTROL_FREQUENCY * 0.8,   # Right arm frequency (Hz)
+                "right_shoulder_yaw": SINE_CONTROL_FREQUENCY * 0.6,    # Waist frequency (Hz)
+                "right_elbow": SINE_CONTROL_FREQUENCY * 0.7,           # Left elbow frequency (Hz)
+                "waist": SINE_CONTROL_FREQUENCY * 0.5,          # Waist frequency (Hz)
             },
             "phase_shifts": {
                 "head_yaw": 0.0,       # Head yaw phase shift
@@ -211,28 +223,31 @@ class MockArmTrackingSystem:
         t = time.time() - self.start_time
         params = self.sine_params
         
-        # Head movements (gentle oscillation)
-        self.joint_positions[0] = self.default_positions[0] + params["amplitudes"]["head_yaw"] * np.sin(
-            2 * np.pi * params["frequencies"]["head_yaw"] * t + params["phase_shifts"]["head_yaw"])
+        # Helper function to calculate sine wave position
+        def calc_sine_pos(joint_idx, param_name, phase_key, phase_offset=0.0):
+            amp = params["amplitudes"][param_name]
+            freq = params["frequencies"][param_name]
+            phase = params["phase_shifts"][phase_key] + phase_offset
+            return self.default_positions[joint_idx] + amp * np.sin(2 * np.pi * freq * t + phase)
         
-        self.joint_positions[1] = self.default_positions[1] + params["amplitudes"]["head_pitch"] * np.sin(
-            2 * np.pi * params["frequencies"]["head_pitch"] * t + params["phase_shifts"]["head_pitch"])
+        # Head movements
+        self.joint_positions[0] = calc_sine_pos(0, "head_yaw", "head_yaw")
+        self.joint_positions[1] = calc_sine_pos(1, "head_pitch", "head_pitch")
         
-        # Left arm joints (indices 2-5)
-        for i in range(2, 6):
-            self.joint_positions[i] = self.default_positions[i] + params["amplitudes"]["left_arm"] * np.sin(
-                2 * np.pi * params["frequencies"]["left_arm"] * t + 
-                params["phase_shifts"]["left_arm"] + (i-2) * 0.2)  # Add slight phase shift between joints
+        # Left arm joints
+        self.joint_positions[2] = calc_sine_pos(2, "left_shoulder_pitch", "left_arm")
+        self.joint_positions[3] = calc_sine_pos(3, "left_shoulder_roll", "left_arm", 0.2)
+        self.joint_positions[4] = calc_sine_pos(4, "left_shoulder_yaw", "left_arm", 0.4)
+        self.joint_positions[5] = calc_sine_pos(5, "left_elbow", "left_arm", 0.6)
         
-        # Right arm joints (indices 6-9)
-        for i in range(6, 10):
-            self.joint_positions[i] = self.default_positions[i] + params["amplitudes"]["right_arm"] * np.sin(
-                2 * np.pi * params["frequencies"]["right_arm"] * t + 
-                params["phase_shifts"]["right_arm"] + (i-6) * 0.2)  # Add slight phase shift between joints
+        # Right arm joints
+        self.joint_positions[6] = calc_sine_pos(6, "right_shoulder_pitch", "right_arm")
+        self.joint_positions[7] = calc_sine_pos(7, "right_shoulder_roll", "right_arm", 0.2)
+        self.joint_positions[8] = calc_sine_pos(8, "right_shoulder_yaw", "right_arm", 0.4)
+        self.joint_positions[9] = calc_sine_pos(9, "right_elbow", "right_arm", 0.6)
         
-        # Waist movement (gentle rotation)
-        self.joint_positions[10] = self.default_positions[10] + params["amplitudes"]["waist"] * np.sin(
-            2 * np.pi * params["frequencies"]["waist"] * t + params["phase_shifts"]["waist"])
+        # Waist movement
+        self.joint_positions[10] = calc_sine_pos(10, "waist", "waist")
     
     def get_joint_positions(self):
         """Get the current joint positions.
