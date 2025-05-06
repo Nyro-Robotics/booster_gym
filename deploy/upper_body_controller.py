@@ -52,6 +52,24 @@ class WebSocketArmTrackingClient:
         self.ws_thread = None
         self.lock = threading.Lock()
         
+        # Define joint limits (in radians) for safety validation
+        # Based on robot hardware specifications
+        DEG_TO_RAD = np.pi / 180.0
+        self.joint_limits = {
+            # [min, max] for each joint in radians
+            0: [-58 * DEG_TO_RAD, 58 * DEG_TO_RAD],    # Head Yaw Joint
+            1: [-18 * DEG_TO_RAD, 47 * DEG_TO_RAD],    # Head Pitch Joint
+            2: [-188 * DEG_TO_RAD, 68 * DEG_TO_RAD],   # Left Shoulder Pitch Joint
+            3: [-94 * DEG_TO_RAD, 88 * DEG_TO_RAD],    # Left Shoulder Roll Joint
+            4: [-128 * DEG_TO_RAD, 128 * DEG_TO_RAD],  # Left Shoulder Yaw Joint
+            5: [-120 * DEG_TO_RAD, 2 * DEG_TO_RAD],    # Left Elbow Joint
+            6: [-188 * DEG_TO_RAD, 68 * DEG_TO_RAD],   # Right Shoulder Pitch Joint
+            7: [-88 * DEG_TO_RAD, 94 * DEG_TO_RAD],    # Right Shoulder Roll Joint
+            8: [-128 * DEG_TO_RAD, 128 * DEG_TO_RAD],  # Right Shoulder Yaw Joint
+            9: [-2 * DEG_TO_RAD, 120 * DEG_TO_RAD],    # Right Elbow Joint
+            10: [-58 * DEG_TO_RAD, 58 * DEG_TO_RAD]    # Waist Yaw Joint
+        }
+        
         # Initialize with default positions
         self._set_default_positions()
     
@@ -79,26 +97,63 @@ class WebSocketArmTrackingClient:
                     
                     # If we have exactly 10 joints (head + arms)
                     if len(arm_positions) == 10:  
-                        # Copy the 10 joints (head + arms) to our array
+                        # Copy the 10 joints (head + arms) to our array as a numpy array
                         # Keep the waist position unchanged (index 10)
-                        self.joint_positions[:10] = np.array(arm_positions)
+                        received_positions = np.array(arm_positions)
+                        
+                        # Apply safety limits to each joint
+                        for i in range(10):
+                            min_val, max_val = self.joint_limits[i]
+                            received_positions[i] = np.clip(received_positions[i], min_val, max_val)
+                            
+                            # Check if the value was clipped and log a warning if it was
+                            if received_positions[i] != arm_positions[i]:
+                                print(f"Warning: Joint {i} value {arm_positions[i]} was outside limits [{min_val}, {max_val}], clipped to {received_positions[i]}")
+                        
+                        # Update joint positions with the clipped values
+                        self.joint_positions[:10] = received_positions
                         
                     # If we have just 8 arm joints (no head)
                     elif len(arm_positions) == 8:  
                         # Update only arm positions (indices 2-9)
                         # Keep head and waist positions unchanged
-                        self.joint_positions[2:10] = np.array(arm_positions)
+                        received_positions = np.array(arm_positions)
+                        
+                        # Apply safety limits to arm joints
+                        for i in range(8):
+                            joint_idx = i + 2  # Offset for arm joints (2-9)
+                            min_val, max_val = self.joint_limits[joint_idx]
+                            received_positions[i] = np.clip(received_positions[i], min_val, max_val)
+                            
+                            # Check if the value was clipped and log a warning if it was
+                            if received_positions[i] != arm_positions[i]:
+                                print(f"Warning: Arm joint {joint_idx} value {arm_positions[i]} was outside limits [{min_val}, {max_val}], clipped to {received_positions[i]}")
+                        
+                        # Update joint positions with the clipped values
+                        self.joint_positions[2:10] = received_positions
                         
                     # If we have just head joints (2)
                     elif len(arm_positions) == 2:
                         # Update only head positions
                         # Keep arm and waist positions unchanged
-                        self.joint_positions[0:2] = np.array(arm_positions)
+                        received_positions = np.array(arm_positions)
+                        
+                        # Apply safety limits to head joints
+                        for i in range(2):
+                            min_val, max_val = self.joint_limits[i]
+                            received_positions[i] = np.clip(received_positions[i], min_val, max_val)
+                            
+                            # Check if the value was clipped and log a warning if it was
+                            if received_positions[i] != arm_positions[i]:
+                                print(f"Warning: Head joint {i} value {arm_positions[i]} was outside limits [{min_val}, {max_val}], clipped to {received_positions[i]}")
+                        
+                        # Update joint positions with the clipped values
+                        self.joint_positions[0:2] = received_positions
                         
                     else:
                         print(f"Warning: Received unexpected number of joint positions: {len(arm_positions)}")
                     
-                    print(f"Received joint positions: {self.joint_positions}")
+                    print(f"Received joint positions (after safety clipping): {self.joint_positions}")
         except json.JSONDecodeError:
             print(f"Error decoding JSON message: {message}")
         except Exception as e:
@@ -148,10 +203,20 @@ class WebSocketArmTrackingClient:
         """Get the current joint positions.
         
         Returns:
-            Array of joint positions for upper body joints (head, arms, waist)
+            Array of joint positions for upper body joints (head, arms, waist),
+            guaranteed to be within safe joint limits
         """
         with self.lock:
-            return np.copy(self.joint_positions)
+            # Double-check that all positions are within limits before returning
+            positions = np.copy(self.joint_positions)
+            
+            # Apply safety limits one more time (defensive programming)
+            for i in range(len(positions)):
+                if i in self.joint_limits:
+                    min_val, max_val = self.joint_limits[i]
+                    positions[i] = np.clip(positions[i], min_val, max_val)
+            
+            return positions
 
 
 class MockArmTrackingSystem:

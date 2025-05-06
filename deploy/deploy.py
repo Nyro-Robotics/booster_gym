@@ -25,7 +25,7 @@ from enum import Enum
 # Global constants for upper body control modes
 # Set one of these to the string value to enable that control mode
 # Options: "policy", "teleop", "sine"
-UPPER_BODY_CONTROL_MODE = "sine"  # Default to policy control
+UPPER_BODY_CONTROL_MODE = "teleop"  # Default to policy control
 
 class BodyPart(Enum):
     LOWER_BODY = 0  # Legs and torso
