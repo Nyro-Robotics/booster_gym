@@ -27,6 +27,11 @@ from enum import Enum
 # Options: "policy", "teleop", "sine"
 UPPER_BODY_CONTROL_MODE = "teleop"  # Default to policy control
 
+# Control parameter for arm gains
+# Lower value means smoother movements with less stiffness
+# Range: 0.1 (very soft) to 1.0 (full stiffness)
+ARM_GAIN_MULTIPLIER = 0.1
+
 class BodyPart(Enum):
     LOWER_BODY = 0  # Legs and torso
     UPPER_BODY = 1  # Arms
@@ -329,11 +334,13 @@ class Controller:
             for i in self.lower_body_indices:
                 self.filtered_dof_target[i] = self.filtered_dof_target[i] * 0.8 + self.dof_target[i] * 0.2
             
-            # Upper body (VR controlled) - less filtering for responsiveness
+            # Upper body (VR controlled) - more filtering for smoothness
             for i in self.upper_body_indices:
                 if self.body_part_control_mode[BodyPart.UPPER_BODY] == "teleop":
-                    # Less filtering for teleop control to be more responsive
-                    self.filtered_dof_target[i] = self.filtered_dof_target[i] * 0.5 + self.dof_target[i] * 0.5
+                    # Stronger filtering for teleop control to be smoother
+                    # Higher first coefficient (0.9) means more of the previous value is retained
+                    # resulting in smoother, less jerky movements
+                    self.filtered_dof_target[i] = self.filtered_dof_target[i] * 0.9 + self.dof_target[i] * 0.1
                 else:
                     # Standard filtering for policy control
                     self.filtered_dof_target[i] = self.filtered_dof_target[i] * 0.8 + self.dof_target[i] * 0.2
@@ -345,10 +352,19 @@ class Controller:
             # Use series-parallel conversion for torque to avoid non-linearity
             for i in self.cfg["mech"]["parallel_mech_indexes"]:
                 self.low_cmd.motor_cmd[i].q = self.dof_pos_latest[i]
+                
+                # Determine if this is an arm joint (indices 2-9 are arm joints)
+                is_arm_joint = i >= 2 and i <= 9
+                
+                # Apply the gain multiplier to arm joints for reduced stiffness
+                gain_multiplier = ARM_GAIN_MULTIPLIER if is_arm_joint else 1.0
+                
+                # Calculate torque with reduced gain for arm joints
                 self.low_cmd.motor_cmd[i].tau = np.clip(
-                    (self.filtered_dof_target[i] - self.dof_pos_latest[i]) * self.cfg["common"]["stiffness"][i],
-                    -self.cfg["common"]["torque_limit"][i],
-                    self.cfg["common"]["torque_limit"][i],
+                    (self.filtered_dof_target[i] - self.dof_pos_latest[i]) * 
+                    self.cfg["common"]["stiffness"][i] * gain_multiplier,
+                    -self.cfg["common"]["torque_limit"][i] * gain_multiplier,
+                    self.cfg["common"]["torque_limit"][i] * gain_multiplier,
                 )
                 self.low_cmd.motor_cmd[i].kp = 0.0
 
