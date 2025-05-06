@@ -33,8 +33,8 @@ DEFAULT_WEBSOCKET_URL = "ws://localhost:8765"  # Default WebSocket URL for arm t
 USE_MOCK_TRACKING = True if UPPER_BODY_CONTROL_MODE == "sine" else False  # Whether to use mock sine wave tracking instead of actual VR teleop via WebSocket
 
 # Sine wave control parameters
-SINE_CONTROL_AMPLITUDE = 0.1      # Base amplitude for sine wave movements
-SINE_CONTROL_FREQUENCY = 0.1      # Base frequency for sine wave movements (Hz)
+SINE_CONTROL_AMPLITUDE = 0.2      # Base amplitude for sine wave movements
+SINE_CONTROL_FREQUENCY = 0.5      # Base frequency for sine wave movements (Hz)
 
 class WebSocketArmTrackingClient:
     """WebSocket client for receiving arm tracking commands.
@@ -258,6 +258,9 @@ def main():
     cfg_file = os.path.join("configs", args.config)
     control_mode = DEFAULT_CONTROL_MODE
 
+    print("="*50)
+    print(f"CONTROL MODE: {control_mode.upper()}")
+    print("="*50)
     print(f"Starting upper body controller in {control_mode} mode, connecting to {args.net} ...")
     ChannelFactory.Instance().Init(0, args.net)
     
