@@ -20,7 +20,22 @@ from utils.remote_control_service import RemoteControlService
 from utils.rotate import rotate_vector_inverse_rpy
 from utils.timer import TimerConfig, Timer
 from utils.policy import Policy
+from enum import Enum
 
+# Global constants for upper body control modes
+# Set one of these to the string value to enable that control mode
+# Options: "policy", "teleop", "sine"
+UPPER_BODY_CONTROL_MODE = "sine"  # Default to policy control
+
+
+class BodyPart(Enum):
+    LOWER_BODY = 0  # Legs and torso
+    UPPER_BODY = 1  # Arms
+
+class UpperBodyControlMode(Enum):
+    POLICY = "policy"    # Upper body controlled by policy
+    TELEOP = "teleop"    # Upper body controlled by VR/teleop
+    SINE = "sine"        # Upper body controlled by sine wave
 
 class Controller:
     def __init__(self, cfg_file) -> None:
@@ -35,6 +50,36 @@ class Controller:
         # Initialize components
         self.remoteControlService = RemoteControlService()
         self.policy = Policy(cfg=self.cfg)
+
+        # Define joint indices for body parts based on the actual robot configuration
+        # Head and arms (upper body)
+        self.upper_body_indices = [
+            0, 1,                # Head (yaw, pitch)
+            2, 3, 4, 5,          # Left arm (shoulder pitch, roll, yaw, elbow)
+            6, 7, 8, 9,          # Right arm (shoulder pitch, roll, yaw, elbow)
+            10                    # Waist yaw
+        ]
+        
+        # Legs (lower body)
+        self.lower_body_indices = [
+            11, 12, 13, 14, 15, 16,  # Left leg (hip pitch, roll, yaw, knee, ankle up/down)
+            17, 18, 19, 20, 21, 22   # Right leg (hip pitch, roll, yaw, knee, ankle up/down)
+        ]
+        
+        # Control mode for each body part
+        self.body_part_control_mode = {
+            BodyPart.LOWER_BODY: "policy",  # Controlled by policy
+            BodyPart.UPPER_BODY: self._determine_upper_body_mode()
+        }
+        
+        # Reference to external sine wave controller
+        self.sine_controller = None
+        
+        # Default positions for manual control
+        self.manual_upper_body_positions = np.array(self.cfg["common"]["default_qpos"], dtype=np.float32)[self.upper_body_indices]
+        
+        # We'll receive sine wave positions from the upper_body_controller
+        self.sine_upper_body_positions = np.copy(self.manual_upper_body_positions)
 
         self._init_timer()
         self._init_low_state_values()
@@ -139,6 +184,68 @@ class Controller:
         self.publish_runner.start()
         print(f"{self.remoteControlService.get_operation_hint()}")
 
+    def _determine_upper_body_mode(self):
+        """Determine the upper body control mode based on global constant"""
+        if UPPER_BODY_CONTROL_MODE == "teleop":
+            return UpperBodyControlMode.TELEOP.value
+        elif UPPER_BODY_CONTROL_MODE == "sine":
+            return UpperBodyControlMode.SINE.value
+        else:
+            # Default to policy control for any other value
+            return UpperBodyControlMode.POLICY.value
+            
+    def set_upper_body_positions(self, positions):
+        """Set the upper body joint positions for teleop control mode.
+        
+        Args:
+            positions: Array of joint positions for upper body joints
+                      Can be either 10 joints (head + arms) or 11 joints (head + arms + waist)
+        """
+        with self.publish_lock:  # Use lock to avoid race conditions
+            if len(positions) == len(self.upper_body_indices):
+                # If we have all 11 joints, copy them directly
+                self.manual_upper_body_positions = np.copy(positions)
+            elif len(positions) == 10:  # If we have 10 joints (head + arms, no waist)
+                # Copy the first 10 joints and keep the waist position unchanged
+                self.manual_upper_body_positions[:10] = np.copy(positions[:10])
+                # Note: waist position at index 10 remains unchanged
+            else:
+                self.logger.warning(f"Received positions array of length {len(positions)}, expected 10 or 11")
+                return
+    
+    def set_body_part_control_mode(self, body_part, mode):
+        """Set the control mode for a specific body part.
+        
+        Args:
+            body_part: BodyPart enum (UPPER_BODY or LOWER_BODY)
+            mode: Control mode ("policy", "teleop", "sine")
+        """
+        if mode in [UpperBodyControlMode.POLICY.value, UpperBodyControlMode.TELEOP.value, UpperBodyControlMode.SINE.value]:
+            self.body_part_control_mode[body_part] = mode
+            self.logger.info(f"Set {body_part} control mode to {mode}")
+        else:
+            self.logger.warning(f"Invalid control mode: {mode}")
+    
+    def set_sine_controller(self, controller):
+        """Set the external sine wave controller.
+        
+        Args:
+            controller: The sine wave controller that provides joint positions
+        """
+        self.sine_controller = controller
+        
+    def set_sine_upper_body_positions(self, positions):
+        """Set the sine wave positions for the upper body from external controller.
+        
+        Args:
+            positions: Array of joint positions for upper body joints
+        """
+        if len(positions) == len(self.upper_body_indices):
+            with self.publish_lock:  # Use lock to avoid race conditions
+                self.sine_upper_body_positions = np.copy(positions)
+        else:
+            self.logger.warning(f"Received sine positions array of length {len(positions)}, expected {len(self.upper_body_indices)}")
+    
     def run(self):
         time_now = self.timer.get_time()
         if time_now < self.next_inference_time:
@@ -149,7 +256,8 @@ class Controller:
         self.logger.debug(f"Next start time: {self.next_inference_time}")
         start_time = time.perf_counter()
 
-        self.dof_target[:] = self.policy.inference(
+        # Get policy inference for all joints
+        policy_targets = self.policy.inference(
             time_now=time_now,
             dof_pos=self.dof_pos,
             dof_vel=self.dof_vel,
@@ -159,6 +267,30 @@ class Controller:
             vy=self.remoteControlService.get_vy_cmd(),
             vyaw=self.remoteControlService.get_vyaw_cmd(),
         )
+        
+        # Apply policy targets to lower body
+        if self.body_part_control_mode[BodyPart.LOWER_BODY] == "policy":
+            for i in self.lower_body_indices:
+                self.dof_target[i] = policy_targets[i]
+        
+        # Apply appropriate control to upper body based on mode
+        upper_body_mode = self.body_part_control_mode[BodyPart.UPPER_BODY]
+        
+        if upper_body_mode == UpperBodyControlMode.TELEOP.value:
+            # Apply manual/teleop targets to upper body
+            for i, idx in enumerate(self.upper_body_indices):
+                self.dof_target[idx] = self.manual_upper_body_positions[i]
+                
+        elif upper_body_mode == UpperBodyControlMode.SINE.value:
+            # Apply sine wave targets to upper body
+            # The sine positions should be updated externally by the upper_body_controller
+            for i, idx in enumerate(self.upper_body_indices):
+                self.dof_target[idx] = self.sine_upper_body_positions[i]
+                
+        else:  # Default to policy control
+            # Use policy for upper body
+            for i in self.upper_body_indices:
+                self.dof_target[i] = policy_targets[i]
 
         inference_time = time.perf_counter()
         self.logger.debug(f"Inference took {(inference_time - start_time)*1000:.4f} ms")
@@ -173,8 +305,21 @@ class Controller:
             self.next_publish_time += self.cfg["common"]["dt"]
             self.logger.debug(f"Next publish time: {self.next_publish_time}")
 
-            self.filtered_dof_target = self.filtered_dof_target * 0.8 + self.dof_target * 0.2
+            # Apply different filtering based on body part
+            # Lower body (policy controlled) - standard filtering
+            for i in self.lower_body_indices:
+                self.filtered_dof_target[i] = self.filtered_dof_target[i] * 0.8 + self.dof_target[i] * 0.2
+            
+            # Upper body (VR controlled) - less filtering for responsiveness
+            for i in self.upper_body_indices:
+                if self.body_part_control_mode[BodyPart.UPPER_BODY] == "teleop":
+                    # Less filtering for teleop control to be more responsive
+                    self.filtered_dof_target[i] = self.filtered_dof_target[i] * 0.5 + self.dof_target[i] * 0.5
+                else:
+                    # Standard filtering for policy control
+                    self.filtered_dof_target[i] = self.filtered_dof_target[i] * 0.8 + self.dof_target[i] * 0.2
 
+            # Set position targets for all joints
             for i in range(B1JointCnt):
                 self.low_cmd.motor_cmd[i].q = self.filtered_dof_target[i]
 
@@ -199,6 +344,41 @@ class Controller:
 
     def __exit__(self, *args) -> None:
         self.cleanup()
+        
+    def set_upper_body_positions(self, positions):
+        """Set manual positions for upper body joints (e.g., from VR tracking)
+        
+        Args:
+            positions: Array of joint positions for upper body joints (indices 0-10)
+        """
+        if len(positions) != len(self.upper_body_indices):
+            self.logger.error(f"Expected {len(self.upper_body_indices)} positions, got {len(positions)}")
+            return
+            
+        self.manual_upper_body_positions = np.array(positions, dtype=np.float32)
+        
+    def set_body_part_control_mode(self, body_part, mode):
+        """Set the control mode for a body part
+        
+        Args:
+            body_part: BodyPart enum (LOWER_BODY or UPPER_BODY)
+            mode: Control mode ("policy", "teleop", or "sine" for upper body; "policy" for lower body)
+        """
+        if body_part == BodyPart.UPPER_BODY:
+            valid_modes = [mode.value for mode in UpperBodyControlMode]
+            if mode not in valid_modes:
+                self.logger.error(f"Invalid upper body control mode: {mode}. Must be one of {valid_modes}")
+                return
+        elif body_part == BodyPart.LOWER_BODY:
+            if mode != "policy":
+                self.logger.error(f"Invalid lower body control mode: {mode}. Only 'policy' is supported")
+                return
+        else:
+            self.logger.error(f"Invalid body part: {body_part}")
+            return
+            
+        self.body_part_control_mode[body_part] = mode
+        self.logger.info(f"Set {body_part} control mode to {mode}")
 
 
 if __name__ == "__main__":
