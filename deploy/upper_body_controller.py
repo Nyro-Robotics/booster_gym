@@ -186,15 +186,15 @@ class MockArmTrackingSystem:
             "amplitudes": {
                 "head_yaw": SINE_CONTROL_AMPLITUDE * 0.7,      # Head yaw amplitude
                 "head_pitch": SINE_CONTROL_AMPLITUDE * 0.3,    # Head pitch amplitude
-                "left_shoulder_pitch": SINE_CONTROL_AMPLITUDE * 1.0,  # Left shoulder pitch amplitude
-                "left_shoulder_roll": SINE_CONTROL_AMPLITUDE * 0.2,   # Left shoulder roll amplitude
-                "left_shoulder_yaw": SINE_CONTROL_AMPLITUDE * 0.6,    # Left shoulder yaw amplitude
+                "left_shoulder_pitch": SINE_CONTROL_AMPLITUDE * 2.0,  # Left shoulder pitch amplitude
+                "left_shoulder_roll": SINE_CONTROL_AMPLITUDE * 0.3,   # Left shoulder roll amplitude
+                "left_shoulder_yaw": SINE_CONTROL_AMPLITUDE * 0.8,    # Left shoulder yaw amplitude
                 "left_elbow": SINE_CONTROL_AMPLITUDE * 0.7,           # Left elbow amplitude
-                "right_shoulder_pitch": SINE_CONTROL_AMPLITUDE   * 1.0,           # Right shoulder pitch amplitude
-                "right_shoulder_roll": SINE_CONTROL_AMPLITUDE * 0.2,           # Right shoulder roll amplitude
-                "right_shoulder_yaw": SINE_CONTROL_AMPLITUDE * 0.6,           # Right shoulder yaw amplitude
+                "right_shoulder_pitch": SINE_CONTROL_AMPLITUDE   * 2.0,           # Right shoulder pitch amplitude
+                "right_shoulder_roll": SINE_CONTROL_AMPLITUDE * 0.3,           # Right shoulder roll amplitude
+                "right_shoulder_yaw": SINE_CONTROL_AMPLITUDE * 0.8,           # Right shoulder yaw amplitude
                 "right_elbow": SINE_CONTROL_AMPLITUDE * 0.7,           # Right elbow amplitude
-                "waist": SINE_CONTROL_AMPLITUDE * 0.8,         # Waist amplitude (disabled)
+                "waist": SINE_CONTROL_AMPLITUDE * 1.0,         # Waist amplitude (disabled)
             },
             "frequencies": {
                 "head_yaw": SINE_CONTROL_FREQUENCY * 0.7,       # Head yaw frequency (Hz)
