@@ -50,6 +50,17 @@ class Controller:
         # Load config
         with open(cfg_file, "r", encoding="utf-8") as f:
             self.cfg = yaml.load(f.read(), Loader=yaml.FullLoader)
+            
+        # Reduce stiffness for arm joints directly in the config
+        # This ensures the arms always have low gains regardless of other settings
+        # Arm joints are indices 2-9: shoulders and elbows
+        ARM_STIFFNESS_FACTOR = 0.01  # Very low stiffness factor for arms
+        if "common" in self.cfg and "stiffness" in self.cfg["common"]:
+            for arm_joint_idx in range(2, 10):  # Indices 2-9 are arm joints
+                if arm_joint_idx < len(self.cfg["common"]["stiffness"]):
+                    # Apply stiffness reduction
+                    self.cfg["common"]["stiffness"][arm_joint_idx] *= ARM_STIFFNESS_FACTOR
+                    self.logger.info(f"Reduced stiffness for arm joint {arm_joint_idx} to {self.cfg['common']['stiffness'][arm_joint_idx]}")
 
         # Initialize components
         self.remoteControlService = RemoteControlService()
@@ -353,18 +364,12 @@ class Controller:
             for i in self.cfg["mech"]["parallel_mech_indexes"]:
                 self.low_cmd.motor_cmd[i].q = self.dof_pos_latest[i]
                 
-                # Determine if this is an arm joint (indices 2-9 are arm joints)
-                is_arm_joint = i >= 2 and i <= 9
-                
-                # Apply the gain multiplier to arm joints for reduced stiffness
-                gain_multiplier = ARM_GAIN_MULTIPLIER if is_arm_joint else 1.0
-                
-                # Calculate torque with reduced gain for arm joints
+                # Calculate torque - stiffness values for arms are already reduced in the config
                 self.low_cmd.motor_cmd[i].tau = np.clip(
                     (self.filtered_dof_target[i] - self.dof_pos_latest[i]) * 
-                    self.cfg["common"]["stiffness"][i] * gain_multiplier,
-                    -self.cfg["common"]["torque_limit"][i] * gain_multiplier,
-                    self.cfg["common"]["torque_limit"][i] * gain_multiplier,
+                    self.cfg["common"]["stiffness"][i],
+                    -self.cfg["common"]["torque_limit"][i],
+                    self.cfg["common"]["torque_limit"][i],
                 )
                 self.low_cmd.motor_cmd[i].kp = 0.0
 
