@@ -30,7 +30,7 @@ UPPER_BODY_CONTROL_MODE = "teleop"  # Default to policy control
 # Control parameter for arm gains
 # Lower value means smoother movements with less stiffness
 # Range: 0.1 (very soft) to 1.0 (full stiffness)
-ARM_GAIN_MULTIPLIER = 0.00001
+ARM_STIFFNESS_FACTOR = 0.05
 
 class BodyPart(Enum):
     LOWER_BODY = 0  # Legs and torso
@@ -54,7 +54,6 @@ class Controller:
         # Reduce stiffness for arm joints directly in the config
         # This ensures the arms always have low gains regardless of other settings
         # Arm joints are indices 2-9: shoulders and elbows
-        ARM_STIFFNESS_FACTOR = 0.01  # Very low stiffness factor for arms
         if "common" in self.cfg and "stiffness" in self.cfg["common"]:
             for arm_joint_idx in range(2, 10):  # Indices 2-9 are arm joints
                 if arm_joint_idx < len(self.cfg["common"]["stiffness"]):
