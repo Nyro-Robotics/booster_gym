@@ -259,12 +259,27 @@ class Controller:
         self.next_inference_time += self.policy.get_policy_interval()
         self.logger.debug(f"Next start time: {self.next_inference_time}")
         start_time = time.perf_counter()
+        
+        # Create copies of dof_pos and dof_vel for policy inference
+        masked_dof_pos = np.copy(self.dof_pos)
+        masked_dof_vel = np.copy(self.dof_vel)
+        
+        # If in sine mode, mask upper body positions and velocities with defaults
+        # so the policy thinks the arms are in their default positions and not moving
+        if self.body_part_control_mode[BodyPart.UPPER_BODY] == UpperBodyControlMode.SINE.value:
+            # Get default positions from policy
+            default_positions = self.policy.default_dof_pos
+            
+            # Replace upper body positions with default positions
+            for i in self.upper_body_indices:
+                masked_dof_pos[i] = default_positions[i]
+                masked_dof_vel[i] = 0.0  # Zero velocity
 
         # Get policy inference for all joints
         policy_targets = self.policy.inference(
             time_now=time_now,
-            dof_pos=self.dof_pos,
-            dof_vel=self.dof_vel,
+            dof_pos=masked_dof_pos,  # Use masked positions
+            dof_vel=masked_dof_vel,  # Use masked velocities
             base_ang_vel=self.base_ang_vel,
             projected_gravity=self.projected_gravity,
             vx=self.remoteControlService.get_vx_cmd(),
