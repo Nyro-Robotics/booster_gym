@@ -186,15 +186,15 @@ class MockArmTrackingSystem:
             "amplitudes": {
                 "head_yaw": SINE_CONTROL_AMPLITUDE * 0.7,      # Head yaw amplitude
                 "head_pitch": SINE_CONTROL_AMPLITUDE * 0.3,    # Head pitch amplitude
-                "left_shoulder_pitch": SINE_CONTROL_AMPLITUDE * 2.0,  # Left shoulder pitch amplitude
+                "left_shoulder_pitch": SINE_CONTROL_AMPLITUDE * 1.0,  # Left shoulder pitch amplitude
                 "left_shoulder_roll": SINE_CONTROL_AMPLITUDE * 0.2,   # Left shoulder roll amplitude
                 "left_shoulder_yaw": SINE_CONTROL_AMPLITUDE * 0.6,    # Left shoulder yaw amplitude
                 "left_elbow": SINE_CONTROL_AMPLITUDE * 0.7,           # Left elbow amplitude
-                "right_shoulder_pitch": SINE_CONTROL_AMPLITUDE   * 1.0,           # Right arm amplitude
-                "right_shoulder_roll": SINE_CONTROL_AMPLITUDE * 0.2,           # Right arm amplitude
-                "right_shoulder_yaw": SINE_CONTROL_AMPLITUDE * 0.6,           # Right arm amplitude
-                "right_elbow": SINE_CONTROL_AMPLITUDE * 0.7,           # Right arm amplitude
-                "waist": SINE_CONTROL_AMPLITUDE * 0.5,         # Waist amplitude (disabled)
+                "right_shoulder_pitch": SINE_CONTROL_AMPLITUDE   * 1.0,           # Right shoulder pitch amplitude
+                "right_shoulder_roll": SINE_CONTROL_AMPLITUDE * 0.2,           # Right shoulder roll amplitude
+                "right_shoulder_yaw": SINE_CONTROL_AMPLITUDE * 0.6,           # Right shoulder yaw amplitude
+                "right_elbow": SINE_CONTROL_AMPLITUDE * 0.7,           # Right elbow amplitude
+                "waist": SINE_CONTROL_AMPLITUDE * 0.8,         # Waist amplitude (disabled)
             },
             "frequencies": {
                 "head_yaw": SINE_CONTROL_FREQUENCY * 0.7,       # Head yaw frequency (Hz)
@@ -215,6 +215,19 @@ class MockArmTrackingSystem:
                 "left_arm": 0.0,       # Left arm phase shift
                 "right_arm": np.pi,    # Right arm phase shift (opposite to left)
                 "waist": 0.25,         # Waist phase shift
+            },
+            "offsets": {
+                "head_yaw": 0.0,                # Head yaw offset
+                "head_pitch": 0.0,              # Head pitch offset
+                "left_shoulder_pitch": 0.0,      # Left shoulder pitch offset
+                "left_shoulder_roll": 1.0,       # Left shoulder roll offset
+                "left_shoulder_yaw": 0.0,        # Left shoulder yaw offset
+                "left_elbow": 0.0,               # Left elbow offset
+                "right_shoulder_pitch": 0.0,      # Right shoulder pitch offset
+                "right_shoulder_roll": -1.0,       # Right shoulder roll offset
+                "right_shoulder_yaw": 0.0,        # Right shoulder yaw offset
+                "right_elbow": 0.0,               # Right elbow offset
+                "waist": 0.0,                    # Waist offset
             }
         }
         
@@ -228,7 +241,8 @@ class MockArmTrackingSystem:
             amp = params["amplitudes"][param_name]
             freq = params["frequencies"][param_name]
             phase = params["phase_shifts"][phase_key] + phase_offset
-            return self.default_positions[joint_idx] + amp * np.sin(2 * np.pi * freq * t + phase)
+            offset = params["offsets"][param_name]
+            return self.default_positions[joint_idx] + offset + amp * np.sin(2 * np.pi * freq * t + phase)
         
         # Head movements
         self.joint_positions[0] = calc_sine_pos(0, "head_yaw", "head_yaw")
