@@ -20,6 +20,7 @@ import json
 import threading
 import websocket
 import yaml
+import logging
 from deploy import Controller, BodyPart, UpperBodyControlMode, UPPER_BODY_CONTROL_MODE
 
 from booster_robotics_sdk_python import ChannelFactory
@@ -29,7 +30,7 @@ from booster_robotics_sdk_python import ChannelFactory
 DEFAULT_CONTROL_MODE = UPPER_BODY_CONTROL_MODE  # Default from deploy.py
 
 # WebSocket parameters
-DEFAULT_WEBSOCKET_URL = "ws://localhost:8765"  # Default WebSocket URL for arm tracking
+DEFAULT_WEBSOCKET_URL = "ws://10.20.0.169:8765"  # Default WebSocket URL for arm tracking
 USE_MOCK_TRACKING = True if UPPER_BODY_CONTROL_MODE == "sine" else False  # Whether to use mock sine wave tracking instead of actual VR teleop via WebSocket
 
 # Sine wave control parameters
@@ -39,18 +40,27 @@ SINE_CONTROL_FREQUENCY = 1.5      # Base frequency for sine wave movements (Hz)
 class WebSocketArmTrackingClient:
     """WebSocket client for receiving arm tracking commands.
     
-    This client connects to a WebSocket server to receive arm joint positions
-    that have already had inverse kinematics applied.
+    When USE_MOCK_TRACKING is False, this class facilitates communication
+    with an external controller (like HardwareInterface from teleoperator.py).
+    It receives target joint positions from the external controller and
+    sends observed/actual joint positions from this robot's hardware.
     """
-    def __init__(self, websocket_url="ws://localhost:8765"):
+    def __init__(self, websocket_url=" ws://10.20.0.169:8765", main_controller_ref=None):
         self.websocket_url = websocket_url
-        # Store positions for all 11 upper body joints (head, arms, waist)
-        # But we'll only receive 10 from WebSocket (head + arms, no waist)
-        self.joint_positions = np.zeros(11)  
+        self.main_controller_ref = main_controller_ref
+        
+        # self.joint_positions is now for OBSERVED positions from hardware
+        self.joint_positions = np.zeros(10)
+        # self.commanded_joint_positions is for TARGET positions from HardwareInterface
+        self.commanded_joint_positions = np.zeros(10)
+        
         self.connected = False
         self.ws = None
         self.ws_thread = None
+        self.sender_thread = None # Thread for periodic sending
         self.lock = threading.Lock()
+        self.last_message_time = None # Added for frequency calculation
+        self.message_count = 0 # Added for periodic frequency logging
         
         # Define joint limits (in radians) for safety validation
         # Based on robot hardware specifications
@@ -67,7 +77,6 @@ class WebSocketArmTrackingClient:
             7: [-88 * DEG_TO_RAD, 94 * DEG_TO_RAD],    # Right Shoulder Roll Joint
             8: [-128 * DEG_TO_RAD, 128 * DEG_TO_RAD],  # Right Shoulder Yaw Joint
             9: [-2 * DEG_TO_RAD, 120 * DEG_TO_RAD],    # Right Elbow Joint
-            10: [-58 * DEG_TO_RAD, 58 * DEG_TO_RAD]    # Waist Yaw Joint
         }
         
         # Initialize with default positions
@@ -77,146 +86,323 @@ class WebSocketArmTrackingClient:
         """Set default joint positions when no data is available."""
         # Default neutral position for all joints
         with self.lock:
-            self.joint_positions = np.zeros(11)  # All 11 upper body joints
+            self.joint_positions = np.zeros(10)  # All 10 upper body joints (head + arms)
+            self.commanded_joint_positions = np.zeros(10) # Also initialize commanded positions for 10 joints
     
     def _on_message(self, ws, message):
         """Handle incoming WebSocket messages with joint positions."""
         try:
-            # Parse the JSON message
+            # Calculate frequency
+            current_time = time.time()
+            self.message_count += 1
+            if self.last_message_time is not None:
+                time_delta = current_time - self.last_message_time
+                if time_delta > 0:
+                    frequency = 1.0 / time_delta
+                    if self.message_count % 100 == 0: # Log every 100 messages
+                        logger.info(f"WebSocket message frequency: {frequency:.2f} Hz")
+            self.last_message_time = current_time
+
+            logger.debug(f"Raw WebSocket message: {message}")
             data = json.loads(message)
             
-            # Expected format: {"joint_positions": [j0, j1, j2, ...]} 
-            # Where the array contains the 8 arm joint positions (4 for each arm)
-            # plus any additional joints like head and waist
-            if "joint_positions" in data and isinstance(data["joint_positions"], list):
-                arm_positions = data["joint_positions"]
+            # Process TARGET commands from HardwareInterface (relayed by server)
+            if data.get("type") == "control_command_list" and "target_positions" in data:
+                command_input_positions = data["target_positions"]
+                logger.debug(f"Received command 'target_positions' list via 'control_command_list': {command_input_positions}")
                 
-                # Update joint positions with lock to avoid race conditions
+                if not isinstance(command_input_positions, list):
+                    logger.warning(f"'target_positions' in 'control_command_list' is not a list: {type(command_input_positions)}")
+                    return # Or handle error appropriately
+
                 with self.lock:
-                    # Handle different formats of incoming data
+                    num_received_commands = len(command_input_positions)
+                    # Store in self.commanded_joint_positions after validation and clipping
+                    # This logic handles various expected lengths of command_input_positions
                     
-                    # If we have exactly 10 joints (head + arms)
-                    if len(arm_positions) == 10:  
-                        # Copy the 10 joints (head + arms) to our array as a numpy array
-                        # Keep the waist position unchanged (index 10)
-                        received_positions = np.array(arm_positions)
-                        
-                        # Apply safety limits to each joint
+                    if num_received_commands == 11: # head, 8 arm, waist - This case should ideally not be hit if sender is 10-joint aware
+                        logger.warning(f"Received 11 target_positions, but system is configured for 10. Will use first 10.")
+                        received_commands_clipped = np.array(command_input_positions[:10], dtype=np.float64) # Take first 10
+                        for i in range(10): # Process only 10
+                            if i in self.joint_limits:
+                                min_val, max_val = self.joint_limits[i]
+                                clipped_val = np.clip(received_commands_clipped[i], min_val, max_val)
+                                if clipped_val != command_input_positions[i]: # Compare with original command_input_positions[i]
+                                    logger.warning(f"Warning: Command for joint {i} value {command_input_positions[i]} was outside limits [{min_val}, {max_val}], clipped to {clipped_val}")
+                                received_commands_clipped[i] = clipped_val
+                        self.commanded_joint_positions[:] = received_commands_clipped[:] # Assign 10 values
+                    elif num_received_commands == 10: # head, 8 arm
+                        received_commands_clipped = np.array(command_input_positions, dtype=np.float64)
                         for i in range(10):
-                            min_val, max_val = self.joint_limits[i]
-                            received_positions[i] = np.clip(received_positions[i], min_val, max_val)
-                            
-                            # Check if the value was clipped and log a warning if it was
-                            if received_positions[i] != arm_positions[i]:
-                                print(f"Warning: Joint {i} value {arm_positions[i]} was outside limits [{min_val}, {max_val}], clipped to {received_positions[i]}")
-                        
-                        # Update joint positions with the clipped values
-                        self.joint_positions[:10] = received_positions
-                        
-                    # If we have just 8 arm joints (no head)
-                    elif len(arm_positions) == 8:  
-                        # Update only arm positions (indices 2-9)
-                        # Keep head and waist positions unchanged
-                        received_positions = np.array(arm_positions)
-                        
-                        # Apply safety limits to arm joints
+                             if i in self.joint_limits: # Check if limit exists for this joint index
+                                 min_val, max_val = self.joint_limits[i]
+                                 clipped_val = np.clip(received_commands_clipped[i], min_val, max_val)
+                                 if clipped_val != command_input_positions[i]:
+                                     logger.warning(f"Warning: Command for joint {i} value {command_input_positions[i]} was outside limits [{min_val}, {max_val}], clipped to {clipped_val}")
+                                 received_commands_clipped[i] = clipped_val
+                        self.commanded_joint_positions[:10] = received_commands_clipped
+                        # Waist joint (index 10) in self.commanded_joint_positions remains unchanged or at its default
+                    elif num_received_commands == 8: # 8 arm only
+                        received_commands_clipped = np.array(command_input_positions, dtype=np.float64)
                         for i in range(8):
-                            joint_idx = i + 2  # Offset for arm joints (2-9)
-                            min_val, max_val = self.joint_limits[joint_idx]
-                            received_positions[i] = np.clip(received_positions[i], min_val, max_val)
-                            
-                            # Check if the value was clipped and log a warning if it was
-                            if received_positions[i] != arm_positions[i]:
-                                print(f"Warning: Arm joint {joint_idx} value {arm_positions[i]} was outside limits [{min_val}, {max_val}], clipped to {received_positions[i]}")
-                        
-                        # Update joint positions with the clipped values
-                        self.joint_positions[2:10] = received_positions
-                        
-                    # If we have just head joints (2)
-                    elif len(arm_positions) == 2:
-                        # Update only head positions
-                        # Keep arm and waist positions unchanged
-                        received_positions = np.array(arm_positions)
-                        
-                        # Apply safety limits to head joints
+                            joint_idx = i + 2 # Offset for arm joints
+                            if joint_idx in self.joint_limits: # Check if limit exists
+                                min_val, max_val = self.joint_limits[joint_idx]
+                                clipped_val = np.clip(received_commands_clipped[i], min_val, max_val)
+                                if clipped_val != command_input_positions[i]:
+                                     logger.warning(f"Warning: Command for Arm joint {joint_idx} value {command_input_positions[i]} was outside limits [{min_val}, {max_val}], clipped to {clipped_val}")
+                                received_commands_clipped[i] = clipped_val
+                        self.commanded_joint_positions[2:10] = received_commands_clipped
+                        # Head (0,1) and Waist (10) in self.commanded_joint_positions remain unchanged
+                    elif num_received_commands == 2: # 2 head only
+                        received_commands_clipped = np.array(command_input_positions, dtype=np.float64)
                         for i in range(2):
-                            min_val, max_val = self.joint_limits[i]
-                            received_positions[i] = np.clip(received_positions[i], min_val, max_val)
-                            
-                            # Check if the value was clipped and log a warning if it was
-                            if received_positions[i] != arm_positions[i]:
-                                print(f"Warning: Head joint {i} value {arm_positions[i]} was outside limits [{min_val}, {max_val}], clipped to {received_positions[i]}")
-                        
-                        # Update joint positions with the clipped values
-                        self.joint_positions[0:2] = received_positions
-                        
+                            if i in self.joint_limits: # Check if limit exists
+                                min_val, max_val = self.joint_limits[i]
+                                clipped_val = np.clip(received_commands_clipped[i], min_val, max_val)
+                                if clipped_val != command_input_positions[i]: # Use original for comparison
+                                    logger.warning(f"Warning: Command for Head joint {i} value {command_input_positions[i]} was outside limits [{min_val}, {max_val}], clipped to {clipped_val}")
+                                received_commands_clipped[i] = clipped_val
+                        self.commanded_joint_positions[0:2] = received_commands_clipped
+                        # Arm (2-9) and Waist (10) in self.commanded_joint_positions remain unchanged
                     else:
-                        print(f"Warning: Received unexpected number of joint positions: {len(arm_positions)}")
+                        logger.warning(f"Warning: Received unexpected number of 'target_positions': {num_received_commands} in 'control_command_list'")
                     
-                    print(f"Received joint positions (after safety clipping): {self.joint_positions}")
+                    logger.debug(f"Stored commanded_joint_positions (after safety clipping from 'target_positions'): {self.commanded_joint_positions.tolist()}")
+
+            # If this client receives observed_joint_positions, it's likely an echo or from another UBC.
+            # For a 2-client setup (HI <-> UBC), UBC should ignore this.
+            elif "observed_joint_positions" in data:
+                logger.debug(f"UBC received an 'observed_joint_positions' message. Ignoring. Message: {message[:150]}")
+                pass # Explicitly do nothing if it's an observation message.
+            
+            else:
+                logger.warning(f"UBC received WebSocket message not matching expected command structures: {message}")
+
         except json.JSONDecodeError:
-            print(f"Error decoding JSON message: {message}")
+            logger.error(f"Error decoding JSON message: {message}")
         except Exception as e:
-            print(f"Error processing message: {e}")
+            logger.error(f"Error processing message: {e}")
     
     def _on_error(self, ws, error):
         """Handle WebSocket errors."""
-        print(f"WebSocket error: {error}")
+        logger.error(f"WebSocket error: {error}")
         self.connected = False
     
     def _on_close(self, ws, close_status_code, close_msg):
         """Handle WebSocket connection close."""
-        print(f"WebSocket connection closed: {close_msg} (code: {close_status_code})")
+        logger.info(f"WebSocket connection closed: {close_msg} (code: {close_status_code})")
         self.connected = False
     
     def _on_open(self, ws):
         """Handle WebSocket connection open."""
-        print(f"WebSocket connection established to {self.websocket_url}")
-        self.connected = True
+        logger.info(f"WebSocket connection established to {self.websocket_url}")
+        self.connected = True # Crucial: set connected True only after ws is confirmed open
     
     def _websocket_thread(self):
         """Run the WebSocket client in a separate thread."""
+        # Initialize WebSocketApp here so self.ws is valid for sender thread checks
         self.ws = websocket.WebSocketApp(self.websocket_url,
                                         on_open=self._on_open,
                                         on_message=self._on_message,
                                         on_error=self._on_error,
                                         on_close=self._on_close)
         self.ws.run_forever()
-    
+        # run_forever exits when ws is closed or an unhandled error occurs that stops it.
+        # Ensure connected is False if we exit this way.
+        self.connected = False 
+        # logger.debug("WebSocket receiver thread stopped.") # Optional debug
+
+    def _periodic_sender(self):
+        """Periodically send a message to the server to request joint state updates."""
+        # logger.debug("Periodic sender thread started.") # Optional debug
+        while self.connected: # Loop while connection is intended to be active
+            # Check if ws exists, ws.sock exists, and ws.sock.connected is True
+            # self.connected can be True briefly before self.ws is fully set up by _on_open
+            # or after self.ws.close() is called but before _on_close fully runs.
+            if self.connected and self.ws and self.ws.sock and self.ws.sock.connected:
+                try:
+                    # If this instance is part of the SERVER logic for HardwareInterface:
+                    # Periodically send OBSERVED joint positions
+                    if self.main_controller_ref:
+                        # The `update_observed_joint_positions_from_hardware()` method, called in the main loop,
+                        # updates `self.joint_positions` using `main_controller_ref.get_actual_hardware_joint_angles()`.
+                        # This sender then transmits these updated `self.joint_positions`.
+                        try:
+                            with self.lock: # Protect access to self.joint_positions
+                                angles_to_send = np.copy(self.joint_positions)
+                            
+                            self.send_joint_positions(angles_to_send) # This sends {"observed_joint_positions": ...}
+                            # logger.debug(f"Periodic_sender sent observed_joint_positions: {angles_to_send.tolist()}")
+
+                        except AttributeError as e:
+                            logger.error(f"WebSocketArmTrackingClient: main_controller_ref might be missing methods, or error accessing it: {e}")
+                        except Exception as e:
+                            logger.error(f"WebSocketArmTrackingClient: Error getting/sending actual hardware angles: {e}")
+                    else:
+                        # Fallback or original ping if not acting as server-part-for-HardwareInterface
+                        ping_message = json.dumps({"action": "request_joint_states", "timestamp": time.time()})
+                        self.ws.send(ping_message)
+
+                except websocket.WebSocketConnectionClosedException:
+                    logger.info("UBC Sender: WebSocket connection closed. Stopping periodic send.")
+                    self.connected = False # Ensure loop terminates
+                    break 
+                except Exception as e:
+                    logger.error(f"UBC Sender: Error sending periodic message: {e}. Assuming connection lost.")
+                    self.connected = False # Stop trying if a persistent error occurs, flag connection as down.
+                    break # Exit the sender loop
+            time.sleep(0.01) # Send request every 10ms (100Hz). Adjust frequency as needed.
+        # logger.debug("Periodic sender thread stopped.") # Optional debug
+
     def connect(self):
-        """Connect to the WebSocket server."""
-        if self.ws_thread is None or not self.ws_thread.is_alive():
-            print(f"Connecting to WebSocket server at {self.websocket_url}...")
+        """Connect to the WebSocket server and start periodic sender."""
+        if not (self.ws_thread and self.ws_thread.is_alive()): # Check if already trying/connected
+            logger.info(f"Connecting to WebSocket server at {self.websocket_url}...")
+            
+            # Reset connected state before attempting
+            self.connected = False 
+
             self.ws_thread = threading.Thread(target=self._websocket_thread)
             self.ws_thread.daemon = True
-            self.ws_thread.start()
+            
+            self.ws_thread.start() # This thread will run _websocket_thread, which initializes self.ws and calls _on_open
+            
+            # Wait for the ws_thread to establish connection and set self.connected = True via _on_open
+            connection_establishment_timeout = 5.0  # seconds
+            start_wait_time = time.time()
+            logger.info("WebSocketArmTrackingClient: Waiting for connection to be established...")
+            while not self.connected and (time.time() - start_wait_time) < connection_establishment_timeout:
+                if not self.ws_thread.is_alive():
+                    logger.warning("WebSocketArmTrackingClient: ws_thread terminated prematurely during connection attempt. Sender not started.")
+                    self.ws = None # Ensure ws is cleared if thread died before ws was set
+                    return # Exit connect method
+                time.sleep(0.1) # Poll self.connected state
+
+            if self.connected:
+                logger.info("WebSocketArmTrackingClient: Connection established. Starting periodic sender.")
+                self.sender_thread = threading.Thread(target=self._periodic_sender)
+                self.sender_thread.daemon = True
+                self.sender_thread.start() # This will loop and wait for self.connected and self.ws to be ready
+            else:
+                logger.error(f"WebSocketArmTrackingClient: Failed to connect to {self.websocket_url} within {connection_establishment_timeout}s. Periodic sender not started.")
+                # Attempt to clean up the ws_thread if it's still alive but didn't connect
+                if self.ws_thread and self.ws_thread.is_alive():
+                    if self.ws:
+                        try:
+                            logger.info("WebSocketArmTrackingClient: Closing WebSocket as connection failed...")
+                            self.ws.close() # This should trigger _on_close and let run_forever exit
+                        except Exception as e:
+                            logger.error(f"WebSocketArmTrackingClient: Error closing WebSocket during failed connect: {e}")
+                    # Give ws_thread a chance to exit cleanly
+                    self.ws_thread.join(timeout=2.0)
+                    if self.ws_thread.is_alive():
+                        logger.warning("WebSocketArmTrackingClient: Warning: ws_thread did not exit cleanly after connection failure.")
+                self.ws = None # Ensure ws is cleared
     
     def disconnect(self):
         """Disconnect from the WebSocket server."""
+        logger.info("Disconnecting WebSocketArmTrackingClient...")
+        self.connected = False # Signal sender and receiver loops to stop
+
         if self.ws is not None:
-            self.ws.close()
+            try:
+                self.ws.close() # This should trigger _on_close in the ws_thread
+            except Exception as e:
+                logger.error(f"Error during WebSocket close: {e}")
+        
+        # Join receiver thread
         if self.ws_thread is not None and self.ws_thread.is_alive():
-            self.ws_thread.join(timeout=1.0)
-        self.connected = False
-    
+            # logger.debug("Joining WebSocket receiver thread...") # Optional debug
+            self.ws_thread.join(timeout=2.0) # Increased timeout slightly
+            if self.ws_thread.is_alive():
+                logger.warning("Warning: WebSocket receiver thread did not exit cleanly.")
+        
+        # Join sender thread
+        if self.sender_thread is not None and self.sender_thread.is_alive():
+            # logger.debug("Joining WebSocket sender thread...") # Optional debug
+            self.sender_thread.join(timeout=2.0)
+            if self.sender_thread.is_alive():
+                logger.warning("Warning: WebSocket sender thread did not exit cleanly.")
+        
+        self.ws = None # Clear WebSocketApp instance
+        logger.info("WebSocketArmTrackingClient disconnected.")
+
+    def send_joint_positions(self, positions):
+        """Send joint positions back through the websocket.
+        
+        Args:
+            positions: Array of joint positions for upper body joints.
+                       These should be OBSERVED/ACTUAL hardware joint positions.
+        """
+        if self.connected and self.ws is not None and self.ws.sock is not None and self.ws.sock.connected:
+            try:
+                # Create a JSON message with the current joint positions
+                pos_list = positions.tolist()
+                message = json.dumps({
+                    "observed_joint_positions": pos_list
+                })
+                
+                # Debug log to verify positions and array length
+                logger.debug(f"Streaming joint positions (length: {len(pos_list)}):\\n{pos_list}")
+                
+                self.ws.send(message)
+            except websocket.WebSocketConnectionClosedException:
+                logger.info("UBC Sender (send_joint_positions): WebSocket connection closed. Cannot send.")
+                # self.connected = False # Let the main receiver/sender threads handle this
+            except Exception as e:
+                logger.error(f"Error sending joint positions: {e}")
+        else:
+            logger.debug("Cannot send joint positions: WebSocket not connected or not fully initialized.")
+
     def get_joint_positions(self):
-        """Get the current joint positions.
+        """Get the current COMMANDED joint positions.
+        
+        These are the target positions received from an external controller
+        (e.g., HardwareInterface) and stored by _on_message.
         
         Returns:
-            Array of joint positions for upper body joints (head, arms, waist),
-            guaranteed to be within safe joint limits
+            Array of COMMANDED joint positions for upper body joints (head, arms, waist),
+            guaranteed to be within safe joint limits.
         """
         with self.lock:
-            # Double-check that all positions are within limits before returning
-            positions = np.copy(self.joint_positions)
-            
-            # Apply safety limits one more time (defensive programming)
-            for i in range(len(positions)):
-                if i in self.joint_limits:
-                    min_val, max_val = self.joint_limits[i]
-                    positions[i] = np.clip(positions[i], min_val, max_val)
-            
-            return positions
+            # Return a copy of the commanded positions
+            # Safety limits were already applied in _on_message when they were stored.
+            return np.copy(self.commanded_joint_positions)
+
+    def update_observed_joint_positions_from_hardware(self):
+        """
+        This method should be called by the main loop of upper_body_controller.py
+        to update the internal `self.joint_positions` with actual readings
+        from the robot's hardware via the main_controller_ref.
+
+        It relies on `self.main_controller_ref` (an instance of your `Controller` 
+        from `deploy.py`) to have a method that provides these angles.
+        """
+        if self.main_controller_ref:
+            try:
+                # This calls the `get_actual_hardware_joint_angles()` method implemented 
+                # in the `Controller` class (e.g., in `deploy.py`).
+                # That method is responsible for using the robot's SDK (e.g., B1LowStateSubscriber)
+                # to read motor positions and map them to the 10 standard upper body joint angles (NO WAIST).
+                actual_angles_hw = self.main_controller_ref.get_actual_hardware_joint_angles()
+
+                if actual_angles_hw is not None:
+                    if len(actual_angles_hw) == 10: # EXPECTING 10 from deploy.py now
+                        with self.lock:
+                            self.joint_positions[:] = actual_angles_hw.astype(np.float32)[:]
+                        # logger.debug(f"Updated self.joint_positions with actual hardware angles: {self.joint_positions.tolist()}")
+                    else:
+                        logger.warning(f"Could not update observed_joint_positions: Controller method returned {len(actual_angles_hw)} angles, expected 10.")
+                else:
+                    logger.warning("Could not update observed_joint_positions: Controller method returned None (perhaps no SDK data yet or error extracting angles).")
+
+            except AttributeError as e:
+                logger.error(f"WebSocketArmTrackingClient: `self.main_controller_ref` is missing the method `get_actual_hardware_joint_angles()`. You need to implement this in your Controller class (e.g., in deploy.py). Error: {e}")
+            except Exception as e:
+                logger.error(f"WebSocketArmTrackingClient: Error updating observed joint positions from hardware: {e}", exc_info=True)
+        else:
+            logger.warning("WebSocketArmTrackingClient: main_controller_ref not set. Cannot update observed joint positions from hardware.")
 
 
 class MockArmTrackingSystem:
@@ -226,22 +412,28 @@ class MockArmTrackingSystem:
     connection is available.
     """
     def __init__(self, config=None):
-        self.joint_positions = np.zeros(11)  # 11 upper body joints
+        self.joint_positions = np.zeros(10)  # 10 upper body joints (head + arms)
         self.start_time = time.time()
         
         # Use the pre-loaded config if provided
         if config is not None and isinstance(config, dict):
             if 'common' in config and 'default_qpos' in config['common']:
-                # Get the upper body joint positions (first 11 values)
-                self.default_positions = np.array(config['common']['default_qpos'][:11], dtype=np.float32)
-                print(f"Using pre-loaded default positions: {self.default_positions}")
+                # Get the upper body joint positions (first 10 values)
+                # Assuming default_qpos in config might still have 11+ values, so slice [0:10]
+                if len(config['common']['default_qpos']) >= 10:
+                    self.default_positions = np.array(config['common']['default_qpos'][:10], dtype=np.float32)
+                    logger.info(f"Using pre-loaded default positions (first 10): {self.default_positions}")
+                else:
+                    logger.warning(f"Warning: default_qpos in config has fewer than 10 values. Using hardcoded 10-joint defaults.")
+                    self.default_positions = np.array([0, 0, 0.2, -1.35, 0, -0.5, 0.2, 1.35, 0, 0.5]) # 10 joints
             else:
-                print("Warning: Could not find default_qpos in provided config, using hardcoded defaults")
-                # Fallback to hardcoded defaults
-                self.default_positions = np.array([0, 0, 0.2, -1.35, 0, -0.5, 0.2, 1.35, 0, 0.5, 0])
+                logger.warning("Warning: Could not find default_qpos in provided config, using hardcoded 10-joint defaults")
+                # Fallback to hardcoded defaults (10 joints)
+                self.default_positions = np.array([0, 0, 0.2, -1.35, 0, -0.5, 0.2, 1.35, 0, 0.5])
         else:
-            # Raise error
-            raise ValueError("No config provided and could not find default_qpos in config")
+            # Raise error or use hardcoded defaults if config is absolutely necessary
+            logger.warning("No config provided for MockArmTrackingSystem. Using hardcoded 10-joint defaults.")
+            self.default_positions = np.array([0, 0, 0.2, -1.35, 0, -0.5, 0.2, 1.35, 0, 0.5]) # 10 joints
         
         # Initialize with default positions
         self.joint_positions = np.copy(self.default_positions)
@@ -259,7 +451,6 @@ class MockArmTrackingSystem:
                 "right_shoulder_roll": SINE_CONTROL_AMPLITUDE * 0.3,           # Right shoulder roll amplitude
                 "right_shoulder_yaw": SINE_CONTROL_AMPLITUDE * 0.8,           # Right shoulder yaw amplitude
                 "right_elbow": SINE_CONTROL_AMPLITUDE * 0.7,           # Right elbow amplitude
-                "waist": SINE_CONTROL_AMPLITUDE * 3.0,         # Waist amplitude (disabled)
             },
             "frequencies": {
                 "head_yaw": SINE_CONTROL_FREQUENCY * 0.7,       # Head yaw frequency (Hz)
@@ -272,14 +463,12 @@ class MockArmTrackingSystem:
                 "right_shoulder_roll": SINE_CONTROL_FREQUENCY * 0.8,   # Right arm frequency (Hz)
                 "right_shoulder_yaw": SINE_CONTROL_FREQUENCY * 0.6,    # Waist frequency (Hz)
                 "right_elbow": SINE_CONTROL_FREQUENCY * 0.7,           # Left elbow frequency (Hz)
-                "waist": SINE_CONTROL_FREQUENCY * 0.5,          # Waist frequency (Hz)
             },
             "phase_shifts": {
                 "head_yaw": 0.0,       # Head yaw phase shift
                 "head_pitch": 0.5,     # Head pitch phase shift
                 "left_arm": 0.0,       # Left arm phase shift
                 "right_arm": np.pi,    # Right arm phase shift (opposite to left)
-                "waist": 0.25,         # Waist phase shift
             },
             "offsets": {
                 "head_yaw": 0.0,                # Head yaw offset
@@ -292,7 +481,6 @@ class MockArmTrackingSystem:
                 "right_shoulder_roll": -1.0,       # Right shoulder roll offset
                 "right_shoulder_yaw": 0.0,        # Right shoulder yaw offset
                 "right_elbow": 0.0,               # Right elbow offset
-                "waist": 0.0,                    # Waist offset
             }
         }
         
@@ -324,9 +512,6 @@ class MockArmTrackingSystem:
         self.joint_positions[7] = calc_sine_pos(7, "right_shoulder_roll", "right_arm", 0.2)
         self.joint_positions[8] = calc_sine_pos(8, "right_shoulder_yaw", "right_arm", 0.4)
         self.joint_positions[9] = calc_sine_pos(9, "right_elbow", "right_arm", 0.6)
-        
-        # Waist movement
-        self.joint_positions[10] = calc_sine_pos(10, "waist", "waist")
     
     def get_joint_positions(self):
         """Get the current joint positions.
@@ -338,7 +523,7 @@ class MockArmTrackingSystem:
 
 
 def signal_handler(sig, frame):
-    print("\nShutting down...")
+    logger.info("\nShutting down...")
     sys.exit(0)
 
 
@@ -346,16 +531,30 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", required=True, type=str, help="Name of the configuration file.")
     parser.add_argument("--net", type=str, default="127.0.0.1", help="Network interface for SDK communication.")
+    parser.add_argument("--log-level", type=str, default="INFO", choices=["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"], help="Logging level (DEBUG, INFO, WARNING, ERROR, CRITICAL)")
 
     args = parser.parse_args()
     
+    # Configure logger
+    numeric_level = getattr(logging, args.log_level.upper(), None)
+    # No need to check if numeric_level is int, argparse choices handle validation
+    # if not isinstance(numeric_level, int):
+    #     raise ValueError(f"Invalid log level: {args.log_level}")
+    logging.basicConfig(level=numeric_level, format='%(asctime)s - %(levelname)s - %(filename)s:%(lineno)d - %(message)s')
+    # Make logger global for use in classes - declared in the previous edit, ensure it's accessible
+    # global logger # This was added in the previous edit if it's truly needed globally.
+    # For class methods, it's better to pass the logger or use logging.getLogger(__name__) within the class if not passed.
+    # However, to keep changes minimal and assuming the previous `global logger` in main was intentional for simplicity:
+    global logger 
+    logger = logging.getLogger(__name__) # This will get the logger configured by basicConfig
+
     cfg_file = os.path.join("configs", args.config)
     control_mode = DEFAULT_CONTROL_MODE
 
-    print("="*50)
-    print(f"CONTROL MODE: {control_mode.upper()}")
-    print("="*50)
-    print(f"Starting upper body controller in {control_mode} mode, connecting to {args.net} ...")
+    logger.info("="*50)
+    logger.info(f"CONTROL MODE: {control_mode.upper()}")
+    logger.info("="*50)
+    logger.info(f"Starting upper body controller in {control_mode} mode, connecting to {args.net} ...")
     ChannelFactory.Instance().Init(0, args.net)
     
     # Initialize the controller and get its config
@@ -367,17 +566,18 @@ def main():
     tracking_system = None
     if control_mode == "teleop":
         if USE_MOCK_TRACKING:
-            print("Using mock arm tracking system")
+            logger.info("Using mock arm tracking system")
             tracking_system = MockArmTrackingSystem(config=config)
         else:
-            print(f"Connecting to WebSocket server at {DEFAULT_WEBSOCKET_URL}")
-            tracking_system = WebSocketArmTrackingClient(DEFAULT_WEBSOCKET_URL)
+            logger.info(f"Connecting to WebSocket server at {DEFAULT_WEBSOCKET_URL}")
+            # Pass the main controller instance to WebSocketArmTrackingClient
+            tracking_system = WebSocketArmTrackingClient(DEFAULT_WEBSOCKET_URL, main_controller_ref=controller)
             tracking_system.connect()
     
     # With the already initialized controller
     with controller:
         time.sleep(2)  # Wait for channels to initialize
-        print("Initialization complete.")
+        logger.info("Initialization complete.")
         
         # Start in custom mode
         controller.start_custom_mode_conditionally()
@@ -389,22 +589,22 @@ def main():
         controller.set_body_part_control_mode(BodyPart.UPPER_BODY, control_mode)
         
         if control_mode == "policy":
-            print("Robot running with policy control for both upper and lower body")
+            logger.info("Robot running with policy control for both upper and lower body")
         elif control_mode == "sine":
-            print("Robot running with sine wave control for upper body")
+            logger.info("Robot running with sine wave control for upper body")
             # Create a sine wave controller with the pre-loaded config
             sine_controller = MockArmTrackingSystem(config=config)
             # Set the sine controller in the main controller
             controller.set_sine_controller(sine_controller)
         elif control_mode == "teleop":
-            print("Robot running with teleop control for upper body")
+            logger.info("Robot running with teleop control for upper body")
             if USE_MOCK_TRACKING:
-                print("Using simulated arm movements")
+                logger.info("Using simulated arm movements")
             else:
-                print(f"Receiving arm tracking data from WebSocket at {DEFAULT_WEBSOCKET_URL}")
-                print("Ensure your tracking system is sending joint positions in the correct format")
+                logger.info(f"Receiving arm tracking data from WebSocket at {DEFAULT_WEBSOCKET_URL}")
+                logger.info("Ensure your tracking system is sending joint positions in the correct format")
         
-        print("Press Ctrl+C to exit")
+        logger.info("Press Ctrl+C to exit")
         
         try:
             while True:
@@ -413,13 +613,23 @@ def main():
                     # Update tracking data if using mock system
                     if USE_MOCK_TRACKING:
                         tracking_system.update()
+                    else:
+                        # If not mock tracking, update the observed positions from actual hardware
+                        # This ensures self.joint_positions in WebSocketArmTrackingClient is fresh
+                        # before the _periodic_sender sends it out.
+                        tracking_system.update_observed_joint_positions_from_hardware()
                     
-                    # Get joint positions from tracking system
-                    upper_body_positions = tracking_system.get_joint_positions()
+                    # Get COMMANDED joint positions from tracking system (received from HardwareInterface)
+                    upper_body_positions_commanded = tracking_system.get_joint_positions()
                     
-                    # Update controller with new upper body positions
-                    controller.set_upper_body_positions(upper_body_positions)
-                    
+                    # Update controller with new COMMANDED upper body positions
+                    # controller.set_upper_body_positions expects 10 joints (head + 8 arms)
+                    # commanded_joint_positions has 11, so we might need to slice it if set_upper_body_positions takes 10
+                    if upper_body_positions_commanded is not None and len(upper_body_positions_commanded) >= 10 :
+                        controller.set_upper_body_positions(upper_body_positions_commanded[:10]) 
+                    else:
+                        logger.warning("Not enough commanded positions received or tracking_system not ready for set_upper_body_positions")
+                        
                 elif control_mode == "sine":
                     # Update sine wave positions
                     sine_controller.update()
@@ -437,13 +647,13 @@ def main():
                 time.sleep(0.01)
                 
         except KeyboardInterrupt:
-            print("\nShutting down...")
+            logger.info("\nShutting down...")
             
         finally:
             # Clean up resources
             if control_mode == "teleop" and tracking_system is not None and not USE_MOCK_TRACKING:
                 tracking_system.disconnect()
-                print("WebSocket connection closed")
+                logger.info("WebSocket connection closed")
 
 
 if __name__ == "__main__":

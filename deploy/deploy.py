@@ -3,6 +3,7 @@ import time
 import yaml
 import logging
 import threading
+from typing import Optional
 
 from booster_robotics_sdk_python import (
     ChannelFactory,
@@ -30,7 +31,7 @@ UPPER_BODY_CONTROL_MODE = "teleop"  # Default to policy control
 # Control parameter for arm gains
 # Lower value means smoother movements with less stiffness
 # Range: 0.1 (very soft) to 1.0 (full stiffness)
-ARM_STIFFNESS_FACTOR = 0.2
+ARM_STIFFNESS_FACTOR = 0.2 * 1.25
 
 class BodyPart(Enum):
     LOWER_BODY = 0  # Legs and torso
@@ -66,12 +67,12 @@ class Controller:
         self.policy = Policy(cfg=self.cfg)
 
         # Define joint indices for body parts based on the actual robot configuration
-        # Head and arms (upper body)
+        # Head and arms (upper body) - NOW 10 JOINTS (NO WAIST)
         self.upper_body_indices = [
             0, 1,                # Head (yaw, pitch)
             2, 3, 4, 5,          # Left arm (shoulder pitch, roll, yaw, elbow)
             6, 7, 8, 9,          # Right arm (shoulder pitch, roll, yaw, elbow)
-            10                    # Waist yaw
+            # 10                    # Waist yaw - REMOVED
         ]
         
         # Legs (lower body)
@@ -93,7 +94,9 @@ class Controller:
         self.manual_upper_body_positions = np.array(self.cfg["common"]["default_qpos"], dtype=np.float32)[self.upper_body_indices]
         
         # We'll receive sine wave positions from the upper_body_controller
-        self.sine_upper_body_positions = np.copy(self.manual_upper_body_positions)
+        # Ensure this also reflects the 10-joint setup if upper_body_indices is used for slicing, or initialize explicitly for 10.
+        # If default_qpos has 11+ elements, self.upper_body_indices will correctly slice the first 10.
+        self.sine_upper_body_positions = np.copy(self.manual_upper_body_positions) # Should now be 10 elements
 
         self._init_timer()
         self._init_low_state_values()
@@ -383,42 +386,41 @@ class Controller:
 
     def __exit__(self, *args) -> None:
         self.cleanup()
-        
-    def set_upper_body_positions(self, positions):
-        """Set manual positions for upper body joints (e.g., from VR tracking)
-        
-        Args:
-            positions: Array of joint positions for upper body joints (indices 0-10)
-        """
-        if len(positions) != len(self.upper_body_indices):
-            self.logger.error(f"Expected {len(self.upper_body_indices)} positions, got {len(positions)}")
-            return
-            
-        self.manual_upper_body_positions = np.array(positions, dtype=np.float32)
-        
-    def set_body_part_control_mode(self, body_part, mode):
-        """Set the control mode for a body part
-        
-        Args:
-            body_part: BodyPart enum (LOWER_BODY or UPPER_BODY)
-            mode: Control mode ("policy", "teleop", or "sine" for upper body; "policy" for lower body)
-        """
-        if body_part == BodyPart.UPPER_BODY:
-            valid_modes = [mode.value for mode in UpperBodyControlMode]
-            if mode not in valid_modes:
-                self.logger.error(f"Invalid upper body control mode: {mode}. Must be one of {valid_modes}")
-                return
-        elif body_part == BodyPart.LOWER_BODY:
-            if mode != "policy":
-                self.logger.error(f"Invalid lower body control mode: {mode}. Only 'policy' is supported")
-                return
-        else:
-            self.logger.error(f"Invalid body part: {body_part}")
-            return
-            
-        self.body_part_control_mode[body_part] = mode
-        self.logger.info(f"Set {body_part} control mode to {mode}")
 
+    def get_actual_hardware_joint_angles(self) -> Optional[np.ndarray]:
+        """
+        Retrieves the current actual joint angles for the 11 upper body joints
+        from the latest low_state data.
+
+        The order of joints returned is:
+        Head Yaw, Head Pitch,
+        L Shoulder Pitch, L Shoulder Roll, L Shoulder Yaw, L Elbow,
+        R Shoulder Pitch, R Shoulder Roll, R Shoulder Yaw, R Elbow,
+        Waist Yaw
+
+        Returns:
+            np.ndarray: An array of 11 joint angles in radians, or None if
+                        upper_body_indices is not properly defined.
+        """
+        if not hasattr(self, 'upper_body_indices') or not self.upper_body_indices:
+            self.logger.error("upper_body_indices not defined in Controller. Cannot get actual hardware joint angles.")
+            return None
+        if not hasattr(self, 'dof_pos_latest'):
+            self.logger.error("dof_pos_latest not available in Controller.")
+            return None
+
+        actual_angles = np.zeros(len(self.upper_body_indices), dtype=np.float32)
+        with self.publish_lock: # Protect access to dof_pos_latest
+            for i, sdk_idx in enumerate(self.upper_body_indices):
+                if 0 <= sdk_idx < len(self.dof_pos_latest):
+                    actual_angles[i] = self.dof_pos_latest[sdk_idx]
+                else:
+                    self.logger.error(f"SDK index {sdk_idx} for upper body joint {i} is out of bounds for dof_pos_latest (len: {len(self.dof_pos_latest)}).")
+                    # Return None or partial data, or raise error? For now, fills with 0 and logs.
+                    actual_angles[i] = 0.0 # Or handle error more strictly
+        
+        # print(f"Actual hardware joint angles: {actual_angles}")
+        return actual_angles
 
 if __name__ == "__main__":
     import argparse
