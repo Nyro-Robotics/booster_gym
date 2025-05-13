@@ -35,8 +35,13 @@ common:
 
 policy:
   policy_path: "./models/T1.pt"
+  standup_policy_path: "./models/standup.pt"
   num_actions: 12
   num_observations: 47
+  standup_num_observations: 42
+  standup_num_actions: 12
+  num_stack: 50
+  standup_joint_indices: [2, 5, 6, 9, 11, 12, 14, 15, 17, 18, 20, 21]
   gait_frequency: 1
 
   normalization:
