@@ -46,11 +46,14 @@ class RemoteControlService:
         self.vx = 0.0
         self.vy = 0.0
         self.vyaw = 0.0
+        self.keyboard_start_custom_mode = False
+        self.keyboard_start_rl_gait = False
+        self.keyboard_start_standup = False
 
     def get_operation_hint(self) -> str:
         if hasattr(self, "joystick") and getattr(self, "joystick") != None:
             return "Left axis for forward/backward/left/right, right axis for rotation left/right"
-        return "Press 'w'/'s' to increase/decrease vx; Press 'a'/'d' to increase/decrease vy; Press 'q'/'e' to increase/decrease vyaw, press 'Space' to stop."
+        return "Press 'w'/'s' to increase/decrease vx; Press 'a'/'d' to increase/decrease vy; Press 'q'/'e' to increase/decrease vyaw, press 'Space' to stop, press 'k' to stand up."
 
     def get_custom_mode_operation_hint(self) -> str:
         if hasattr(self, "joystick") and getattr(self, "joystick") != None:
@@ -67,6 +70,7 @@ class RemoteControlService:
         self.joystick_runner = None
         self.keyboard_start_custom_mode = False
         self.keyboard_start_rl_gait = False
+        self.keyboard_start_standup = False
 
     def _start_keyboard_thread(self):
         self.keyboard_runner = threading.Thread(target=listen_keyboard, args=(self._handle_keyboard_press,))
@@ -78,6 +82,9 @@ class RemoteControlService:
             self.keyboard_start_custom_mode = True
         if key == "r":
             self.keyboard_start_rl_gait = True
+        if key == "k":
+            self.keyboard_start_standup = True
+            print("Standup triggered")
         if key == "w":
             old_x = self.vx
             self.vx += 0.1
@@ -168,6 +175,15 @@ class RemoteControlService:
         if hasattr(self, "joystick") and getattr(self, "joystick") != None:
             return self.joystick.active_keys() == [self.config.rl_gait_button]
         return self.keyboard_start_rl_gait
+
+    def start_standup(self) -> bool:
+        """Check if stand-up key 'k' is pressed."""
+        if hasattr(self, "joystick") and getattr(self, "joystick") != None:
+            return False
+        standup_triggered = self.keyboard_start_standup
+        if standup_triggered:
+            self.keyboard_start_standup = False
+        return standup_triggered
 
     def _run_joystick(self):
         """Poll joystick events."""

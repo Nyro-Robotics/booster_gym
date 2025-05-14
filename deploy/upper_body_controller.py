@@ -45,7 +45,7 @@ class WebSocketArmTrackingClient:
     It receives target joint positions from the external controller and
     sends observed/actual joint positions from this robot's hardware.
     """
-    def __init__(self, websocket_url=" ws://10.20.0.169:8765", main_controller_ref=None):
+    def __init__(self, websocket_url=" ws://10.20.0.169:8765", main_controller_ref=None, config=None):
         self.websocket_url = websocket_url
         self.main_controller_ref = main_controller_ref
         
@@ -53,6 +53,28 @@ class WebSocketArmTrackingClient:
         self.joint_positions = np.zeros(10)
         # self.commanded_joint_positions is for TARGET positions from HardwareInterface
         self.commanded_joint_positions = np.zeros(10)
+        # Set to False initially; will be set to True once valid commands are received
+        self.has_received_valid_commands = False
+        
+        # Initialize default positions from config
+        if config is not None and isinstance(config, dict):
+            if 'common' in config and 'default_qpos' in config['common']:
+                # Get the upper body joint positions (first 10 values)
+                if len(config['common']['default_qpos']) >= 10:
+                    self.default_positions = np.array(config['common']['default_qpos'][:10], dtype=np.float32)
+                    logger.info(f"WebSocketArmTrackingClient: Using default positions from config: {self.default_positions}")
+                else:
+                    logger.warning(f"WebSocketArmTrackingClient: default_qpos in config has fewer than 10 values. Using hardcoded defaults.")
+                    self.default_positions = np.array([0, 0, 0.2, -1.35, 0, -0.5, 0.2, 1.35, 0, 0.5])
+            else:
+                logger.warning("WebSocketArmTrackingClient: Could not find default_qpos in config, using hardcoded defaults")
+                self.default_positions = np.array([0, 0, 0.2, -1.35, 0, -0.5, 0.2, 1.35, 0, 0.5])
+        else:
+            logger.warning("WebSocketArmTrackingClient: No config provided, using hardcoded defaults")
+            self.default_positions = np.array([0, 0, 0.2, -1.35, 0, -0.5, 0.2, 1.35, 0, 0.5])
+        
+        # Initialize commanded positions with default positions
+        self.commanded_joint_positions = np.copy(self.default_positions)
         
         self.connected = False
         self.ws = None
@@ -78,16 +100,6 @@ class WebSocketArmTrackingClient:
             8: [-128 * DEG_TO_RAD, 128 * DEG_TO_RAD],  # Right Shoulder Yaw Joint
             9: [-2 * DEG_TO_RAD, 120 * DEG_TO_RAD],    # Right Elbow Joint
         }
-        
-        # Initialize with default positions
-        self._set_default_positions()
-    
-    def _set_default_positions(self):
-        """Set default joint positions when no data is available."""
-        # Default neutral position for all joints
-        with self.lock:
-            self.joint_positions = np.zeros(10)  # All 10 upper body joints (head + arms)
-            self.commanded_joint_positions = np.zeros(10) # Also initialize commanded positions for 10 joints
     
     def _on_message(self, ws, message):
         """Handle incoming WebSocket messages with joint positions."""
@@ -131,6 +143,7 @@ class WebSocketArmTrackingClient:
                                     logger.warning(f"Warning: Command for joint {i} value {command_input_positions[i]} was outside limits [{min_val}, {max_val}], clipped to {clipped_val}")
                                 received_commands_clipped[i] = clipped_val
                         self.commanded_joint_positions[:] = received_commands_clipped[:] # Assign 10 values
+                        self.has_received_valid_commands = True
                     elif num_received_commands == 10: # head, 8 arm
                         received_commands_clipped = np.array(command_input_positions, dtype=np.float64)
                         for i in range(10):
@@ -141,6 +154,7 @@ class WebSocketArmTrackingClient:
                                      logger.warning(f"Warning: Command for joint {i} value {command_input_positions[i]} was outside limits [{min_val}, {max_val}], clipped to {clipped_val}")
                                  received_commands_clipped[i] = clipped_val
                         self.commanded_joint_positions[:10] = received_commands_clipped
+                        self.has_received_valid_commands = True
                         # Waist joint (index 10) in self.commanded_joint_positions remains unchanged or at its default
                     elif num_received_commands == 8: # 8 arm only
                         received_commands_clipped = np.array(command_input_positions, dtype=np.float64)
@@ -153,6 +167,7 @@ class WebSocketArmTrackingClient:
                                      logger.warning(f"Warning: Command for Arm joint {joint_idx} value {command_input_positions[i]} was outside limits [{min_val}, {max_val}], clipped to {clipped_val}")
                                 received_commands_clipped[i] = clipped_val
                         self.commanded_joint_positions[2:10] = received_commands_clipped
+                        self.has_received_valid_commands = True
                         # Head (0,1) and Waist (10) in self.commanded_joint_positions remain unchanged
                     elif num_received_commands == 2: # 2 head only
                         received_commands_clipped = np.array(command_input_positions, dtype=np.float64)
@@ -164,6 +179,7 @@ class WebSocketArmTrackingClient:
                                     logger.warning(f"Warning: Command for Head joint {i} value {command_input_positions[i]} was outside limits [{min_val}, {max_val}], clipped to {clipped_val}")
                                 received_commands_clipped[i] = clipped_val
                         self.commanded_joint_positions[0:2] = received_commands_clipped
+                        self.has_received_valid_commands = True
                         # Arm (2-9) and Waist (10) in self.commanded_joint_positions remain unchanged
                     else:
                         logger.warning(f"Warning: Received unexpected number of 'target_positions': {num_received_commands} in 'control_command_list'")
@@ -363,9 +379,15 @@ class WebSocketArmTrackingClient:
         
         Returns:
             Array of COMMANDED joint positions for upper body joints (head, arms, waist),
-            guaranteed to be within safe joint limits.
+            guaranteed to be within safe joint limits. If no valid commands have been
+            received yet, returns the default positions from the config.
         """
         with self.lock:
+            # If no valid commands have been received yet, return default positions
+            if not self.has_received_valid_commands:
+                logger.debug("No valid commanded positions received yet; returning default positions")
+                return np.copy(self.default_positions)
+            
             # Return a copy of the commanded positions
             # Safety limits were already applied in _on_message when they were stored.
             return np.copy(self.commanded_joint_positions)
@@ -474,11 +496,11 @@ class MockArmTrackingSystem:
                 "head_yaw": 0.0,                # Head yaw offset
                 "head_pitch": 0.0,              # Head pitch offset
                 "left_shoulder_pitch": 0.0,      # Left shoulder pitch offset
-                "left_shoulder_roll": 1.0,       # Left shoulder roll offset
+                "left_shoulder_roll": 0.0,       # Left shoulder roll offset
                 "left_shoulder_yaw": 0.0,        # Left shoulder yaw offset
                 "left_elbow": 0.0,               # Left elbow offset
                 "right_shoulder_pitch": 0.0,      # Right shoulder pitch offset
-                "right_shoulder_roll": -1.0,       # Right shoulder roll offset
+                "right_shoulder_roll": 0.0,       # Right shoulder roll offset
                 "right_shoulder_yaw": 0.0,        # Right shoulder yaw offset
                 "right_elbow": 0.0,               # Right elbow offset
             }
@@ -571,7 +593,7 @@ def main():
         else:
             logger.info(f"Connecting to WebSocket server at {DEFAULT_WEBSOCKET_URL}")
             # Pass the main controller instance to WebSocketArmTrackingClient
-            tracking_system = WebSocketArmTrackingClient(DEFAULT_WEBSOCKET_URL, main_controller_ref=controller)
+            tracking_system = WebSocketArmTrackingClient(DEFAULT_WEBSOCKET_URL, main_controller_ref=controller, config=config)
             tracking_system.connect()
     
     # With the already initialized controller

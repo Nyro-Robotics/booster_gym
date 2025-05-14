@@ -17,7 +17,7 @@ class StandupPolicy:
             # Load standup specific parameters from config
             self.num_observations = self.cfg["policy"]["standup_num_observations"]
             self.num_actions = self.cfg["policy"]["standup_num_actions"]
-            self.num_stack = self.cfg["policy"]["num_stack"] # Expecting this in the config now
+            self.num_stack = self.cfg["policy"]["num_stack"]
             self.standup_real_joint_indices = np.array(self.cfg["policy"]["standup_joint_indices"], dtype=int)
             
             if len(self.standup_real_joint_indices) != self.num_actions:
@@ -62,7 +62,7 @@ class StandupPolicy:
         self.actions = np.zeros(self.num_actions, dtype=np.float32) # Stores the latest computed actions
         
         # Initialize stacked_obs buffer
-        # Shape will be (num_stack, num_observations) for easier handling
+        # Shape will be (num_stack, num_observations) for stacking history
         self.stacked_obs = np.zeros((self.num_stack, self.num_observations), dtype=np.float32)
         
         # Calculate and store policy interval
@@ -136,19 +136,25 @@ class StandupPolicy:
 
         # --- Policy Inference with Mirroring ---
         try:
-            # Add batch dimension for the policy (expects [batch, stack, obs_dim])
-            # Assuming the JIT model expects stacked obs as input [batch, stack, features]
-            stacked_obs_tensor = torch.from_numpy(self.stacked_obs).unsqueeze(0)
+            # Create single observation tensor with batch dimension [batch, obs_dim]
+            obs_tensor = torch.from_numpy(self.obs[np.newaxis, :])
+            
+            # Create stacked observation tensor with batch dimension [batch, stack, obs_dim]
+            stacked_obs_tensor = torch.from_numpy(self.stacked_obs[np.newaxis, :, :])
 
-            # Mirror stacked observations
-            # Need to handle the stack dimension correctly in mirror_obs
-            mirrored_stacked_obs_numpy = self.mirror_obs(self.stacked_obs)
-            mirrored_stacked_obs_tensor = torch.from_numpy(mirrored_stacked_obs_numpy).unsqueeze(0)
+            # Create mirrored versions of both tensors
+            mirrored_obs_numpy = self.mirror_obs(self.obs)
+            mirrored_obs_tensor = torch.from_numpy(mirrored_obs_numpy[np.newaxis, :])
+            
+            mirrored_stacked_obs_numpy = self.mirror_obs(self.stacked_obs) 
+            mirrored_stacked_obs_tensor = torch.from_numpy(mirrored_stacked_obs_numpy[np.newaxis, :, :])
 
             # Get actions from original and mirrored inputs
-            # Assuming policy returns actions directly [batch, action_dim]
-            actions_original_numpy = self.policy(stacked_obs_tensor).squeeze(0).detach().numpy()
-            actions_mirrored_raw_numpy = self.policy(mirrored_stacked_obs_tensor).squeeze(0).detach().numpy()
+            # New model structure takes two inputs: (obs, stacked_obs)
+            actions_original_numpy = self.policy(
+                obs_tensor, stacked_obs_tensor).squeeze(0).detach().numpy()
+            actions_mirrored_raw_numpy = self.policy(
+                mirrored_obs_tensor, mirrored_stacked_obs_tensor).squeeze(0).detach().numpy()
 
             # Mirror the actions derived from mirrored observations
             actions_mirrored_processed_numpy = self.mirror_act(actions_mirrored_raw_numpy)
@@ -156,12 +162,13 @@ class StandupPolicy:
             # Average original and processed mirrored actions
             final_actions = 0.5 * (actions_original_numpy + actions_mirrored_processed_numpy)
 
+            logger.info(f"final_actions: {final_actions}")
             # Clip and store actions for the *next* observation and for target calculation
-            clip_val = norm_cfg["clip_actions"]
+            clip_val = norm_cfg["standup_clip_actions"]
             self.actions[:] = np.clip(final_actions, -clip_val, clip_val)
 
         except Exception as e:
-             logger.exception(f"Error during stand-up policy inference (stacking/mirroring): {e}") # Use logger.exception for traceback
+             logger.exception(f"Error during stand-up policy inference: {e}") # Use logger.exception for traceback
              self.actions.fill(0.0) # Default to zero actions on error
 
         # --- Target Calculation ---
@@ -171,22 +178,25 @@ class StandupPolicy:
         # Re-fetch from cfg for clarity, or use a stored full version.
         full_default_dof_pos = np.array(self.cfg["common"]["default_qpos"], dtype=np.float32)
         self.dof_targets[:] = full_default_dof_pos 
-        
+        logger.info(f"self.dof_targets: {self.dof_targets}")
+
         # Apply scaled actions from policy ONLY to the specified standup joints
         action_scale = self.cfg["policy"]["control"]["action_scale"]
-        self.dof_targets[self.standup_real_joint_indices] += action_scale * self.actions
+        self.dof_targets[self.standup_real_joint_indices] += np.clip(action_scale * self.actions, -norm_cfg["post_action_scale_clip_actions"], norm_cfg["post_action_scale_clip_actions"])
+        logger.info(f"self.dof_targets: {self.dof_targets}")
         
         # Joints not in standup_real_joint_indices remain at their default positions.
         # If specific behavior is needed for non-controlled joints during standup
         # (e.g., keep head still), it would need explicit logic here.
 
-        return self.dof_targets 
+
+        return self.dof_targets
 
     # --- Added: Mirroring Static Methods ---
     @staticmethod
     def mirror_obs(obs):
         """Mirrors observations. Handles stacked observations (N, 42) or single (42,)."""
-        # Assuming obs has 42 features based on mujoco.py
+        # 42 features from observations
         num_features = 42
         if obs.shape[-1] != num_features:
              raise ValueError(f"Expected observation to have {num_features} features, but got {obs.shape[-1]}")

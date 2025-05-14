@@ -35,7 +35,7 @@ common:
 
 policy:
   policy_path: "./models/T1.pt"
-  standup_policy_path: "./models/standup.pt"
+  standup_policy_path: "./models/T1FallRecoveryRandom_latest.pt"
   num_actions: 12
   num_observations: 47
   standup_num_observations: 42
@@ -51,9 +51,11 @@ policy:
     dof_pos: 1.0
     dof_vel: 0.1
     clip_actions: 1.
+    standup_clip_actions: 5
+    post_action_scale_clip_actions: 5.
 
   control:
-    action_scale: 1.
+    action_scale: 1
     decimation: 10
 
 mech:

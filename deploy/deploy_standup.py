@@ -21,12 +21,8 @@ from utils.remote_control_service import RemoteControlService
 from utils.rotate import rotate_vector_inverse_rpy
 from utils.timer import TimerConfig, Timer
 from utils.policy import Policy
+from utils.standup_policy import StandupPolicy
 from enum import Enum
-from utils.standup_policy import StandupPolicy # Import StandupPolicy
-import select # For non-blocking input
-import sys # For stdin
-import tty # For raw input mode
-import termios # For terminal settings
 
 # Global constants for upper body control modes
 # Set one of these to the string value to enable that control mode
@@ -38,18 +34,6 @@ UPPER_BODY_CONTROL_MODE = "teleop"  # Default to policy control
 # Range: 0.1 (very soft) to 1.0 (full stiffness)
 ARM_STIFFNESS_FACTOR = 0.2 * 1.25 * 1.25 # * 1.25
 
-# Standup success parameters
-STANDUP_SUCCESS_DURATION_S = 10.0  # Seconds to wait in STADING_UP before checking stability
-UPRIGHT_IMU_THRESHOLD_RP = 0.35 # Radians (approx 20 degrees) for roll/pitch to be considered upright
-STANDUP_ATTEMPT_TIMEOUT_S = 15.0 # Max duration for a standup attempt
-
-# Define robot states
-class RobotState(Enum):
-    WALKING = 0             # Normal operation, walking policy active
-    FALLEN = 1              # Robot has fallen based on IMU data
-    WAITING_FOR_STANDUP = 2 # Fallen, waited 5s, waiting for user input 's'
-    STANDING_UP = 3         # Stand-up policy active
-
 class BodyPart(Enum):
     LOWER_BODY = 0  # Legs and torso
     UPPER_BODY = 1  # Arms
@@ -58,6 +42,11 @@ class UpperBodyControlMode(Enum):
     POLICY = "policy"    # Upper body controlled by policy
     TELEOP = "teleop"    # Upper body controlled by VR/teleop
     SINE = "sine"        # Upper body controlled by sine wave
+
+class ControlMode(Enum):
+    NORMAL = 0          # Normal policy control
+    STANDUP = 1         # Standup policy control
+    IDLE = 2            # No policy control (when robot has fallen and no 'k' pressed)
 
 class Controller:
     def __init__(self, cfg_file) -> None:
@@ -82,7 +71,12 @@ class Controller:
         # Initialize components
         self.remoteControlService = RemoteControlService()
         self.policy = Policy(cfg=self.cfg)
-        self.standup_policy = StandupPolicy(cfg=self.cfg) # Initialize StandupPolicy
+        self.standup_policy = StandupPolicy(cfg=self.cfg)
+        
+        # Control mode state
+        self.control_mode = ControlMode.NORMAL
+        self.robot_fallen = False
+        self.standup_requested = False
 
         # Define joint indices for body parts based on the actual robot configuration
         # Head and arms (upper body) - NOW 10 JOINTS (NO WAIST)
@@ -121,9 +115,6 @@ class Controller:
         self._init_communication()
         self.publish_runner = None
         self.running = True
-        self.state = RobotState.WALKING # Initial state
-        self.fall_detected_time: Optional[float] = None # Time when fall was detected
-        self.standup_start_time: Optional[float] = None # Time when standup started
 
         self.publish_lock = threading.Lock()
 
@@ -135,7 +126,6 @@ class Controller:
     def _init_low_state_values(self):
         self.base_ang_vel = np.zeros(3, dtype=np.float32)
         self.projected_gravity = np.zeros(3, dtype=np.float32)
-        self.current_imu_rpy = np.zeros(3, dtype=np.float32) # Store current IMU RPY values
         self.dof_pos = np.zeros(B1JointCnt, dtype=np.float32)
         self.dof_vel = np.zeros(B1JointCnt, dtype=np.float32)
 
@@ -158,23 +148,30 @@ class Controller:
             raise
 
     def _low_state_handler(self, low_state_msg: LowState):
-        # Always update current IMU RPY
-        with self.publish_lock: # Protect access if other threads might read it, though unlikely here
-             self.current_imu_rpy[:] = low_state_msg.imu_state.rpy
-
-        # Only process state changes if currently walking
-        if self.state == RobotState.WALKING:
-            # Check for fall condition (IMU roll/pitch > 1.0 rad)
-            if abs(low_state_msg.imu_state.rpy[0]) > 1.0 or abs(low_state_msg.imu_state.rpy[1]) > 1.0:
-                if self.state == RobotState.WALKING: # Only trigger fall detection once
-                    self.logger.warning("FALL DETECTED! IMU base rpy values: {}".format(low_state_msg.imu_state.rpy))
-                    self.state = RobotState.FALLEN
-                    self.fall_detected_time = self.timer.get_time()
-                    self.logger.info(f"State changed to {self.state} at time {self.fall_detected_time:.2f}. Waiting 5 seconds.")
-                    # Optionally, stop the publisher thread or change its behavior immediately
-                    # self.running = False # Decide if falling should stop the publisher thread entirely or just change policy
-
-        # Continue processing low state data regardless of fall state for monitoring/logging
+        # Check if robot has fallen over by checking IMU values
+        self.robot_fallen = abs(low_state_msg.imu_state.rpy[0]) > 1.0 or abs(low_state_msg.imu_state.rpy[1]) > 1.0
+        
+        # Check if standup is requested
+        if self.remoteControlService.start_standup():
+            self.standup_requested = True
+            self.logger.info("Standup requested via 'k' key")
+            
+        # Update control mode based on standup request and robot state
+        if self.standup_requested:
+            self.control_mode = ControlMode.STANDUP
+            # Once we're in standup mode, we stay there until robot is upright
+            # if not self.robot_fallen:
+            #     self.logger.info("Robot stood up successfully, returning to normal control")
+            #     self.control_mode = ControlMode.NORMAL
+            #     self.standup_requested = False
+        elif self.robot_fallen:
+            # Robot has fallen but no standup requested yet
+            self.control_mode = ControlMode.IDLE
+            # self.logger.warning("Robot has fallen, waiting for standup command ('k')")
+        else:
+            # Robot is upright and no standup requested
+            self.control_mode = ControlMode.NORMAL
+            
         self.timer.tick_timer_if_sim()
         time_now = self.timer.get_time()
         for i, motor in enumerate(low_state_msg.motor_state_serial):
@@ -236,6 +233,7 @@ class Controller:
         self.publish_runner.daemon = True
         self.publish_runner.start()
         print(f"{self.remoteControlService.get_operation_hint()}")
+        print("Press 'k' to execute standup if the robot falls over or to test the standup policy")
 
     def _determine_upper_body_mode(self):
         """Determine the upper body control mode based on global constant"""
@@ -306,117 +304,94 @@ class Controller:
     
     def run(self):
         time_now = self.timer.get_time()
-        
-        # State machine logic
-        if self.state == RobotState.FALLEN:
-            if self.fall_detected_time is not None and (time_now - self.fall_detected_time >= 5.0):
-                self.state = RobotState.WAITING_FOR_STANDUP
-                self.logger.info(f"State changed to {self.state}. Press 's' to attempt stand-up.")
-            # Do not run inference or advance timers while fallen or waiting
-            time.sleep(0.01) # Prevent busy-waiting
-            return
-            
-        if self.state == RobotState.WAITING_FOR_STANDUP:
-            # Wait for external input (handled in main loop) to change state
-            time.sleep(0.01) # Prevent busy-waiting
-            return
-
-        # Proceed with inference only if WALKING or STANDING_UP
         if time_now < self.next_inference_time:
             time.sleep(0.001)
             return
-        
         self.logger.debug("-----------------------------------------------------")
-        # Determine which policy interval to use
-        current_policy_interval = self.policy.get_policy_interval() if self.state == RobotState.WALKING else self.standup_policy.get_policy_interval()
-        self.next_inference_time += current_policy_interval
-        self.logger.debug(f"State: {self.state} | Next inference time: {self.next_inference_time}")
+        self.next_inference_time += self.policy.get_policy_interval()
+        self.logger.debug(f"Next start time: {self.next_inference_time}")
         start_time = time.perf_counter()
         
         # Create copies of dof_pos and dof_vel for policy inference
         masked_dof_pos = np.copy(self.dof_pos)
         masked_dof_vel = np.copy(self.dof_vel)
         
-        # If in sine mode, mask upper body positions and velocities with defaults
-        # so the policy thinks the arms are in their default positions and not moving
-        # This masking might need adjustment based on standup policy needs
-        if self.body_part_control_mode[BodyPart.UPPER_BODY] == UpperBodyControlMode.SINE.value:
-            # Get default positions from policy
-            default_positions = self.policy.default_dof_pos
-            
-            # Replace upper body positions with default positions
-            for i in self.upper_body_indices:
-                masked_dof_pos[i] = default_positions[i]
-                masked_dof_vel[i] = 0.0  # Zero velocity
+        # Handle different control modes
+        if self.control_mode == ControlMode.NORMAL:
+            # Normal operation with walking policy
+            # If in sine mode, mask upper body positions and velocities with defaults
+            # so the policy thinks the arms are in their default positions and not moving
+            if self.body_part_control_mode[BodyPart.UPPER_BODY] == UpperBodyControlMode.SINE.value:
+                # Get default positions from policy
+                default_positions = self.policy.default_dof_pos
+                
+                # Replace upper body positions with default positions
+                for i in self.upper_body_indices:
+                    masked_dof_pos[i] = default_positions[i]
+                    masked_dof_vel[i] = 0.0  # Zero velocity
 
-        # Select the appropriate policy based on the current state
-        if self.state == RobotState.WALKING:
-            active_policy = self.policy
-            policy_targets = active_policy.inference(
+            # Get policy inference for all joints
+            policy_targets = self.policy.inference(
                 time_now=time_now,
-                dof_pos=masked_dof_pos,  # Use masked positions if necessary for walking
-                dof_vel=masked_dof_vel,  # Use masked velocities if necessary
+                dof_pos=masked_dof_pos,  # Use masked positions
+                dof_vel=masked_dof_vel,  # Use masked velocities
                 base_ang_vel=self.base_ang_vel,
                 projected_gravity=self.projected_gravity,
                 vx=self.remoteControlService.get_vx_cmd(),
                 vy=self.remoteControlService.get_vy_cmd(),
                 vyaw=self.remoteControlService.get_vyaw_cmd(),
             )
-        elif self.state == RobotState.STANDING_UP:
-            active_policy = self.standup_policy
-            # Standup policy will not use vx, vy, vyaw or masking
-            policy_targets = active_policy.inference(
+            
+            # Apply policy targets to lower body
+            if self.body_part_control_mode[BodyPart.LOWER_BODY] == "policy":
+                for i in self.lower_body_indices:
+                    self.dof_target[i] = policy_targets[i]
+            
+            # Apply appropriate control to upper body based on mode
+            upper_body_mode = self.body_part_control_mode[BodyPart.UPPER_BODY]
+            
+            if upper_body_mode == UpperBodyControlMode.TELEOP.value:
+                # Apply manual/teleop targets to upper body
+                for i, idx in enumerate(self.upper_body_indices):
+                    self.dof_target[idx] = self.manual_upper_body_positions[i]
+                    
+            elif upper_body_mode == UpperBodyControlMode.SINE.value:
+                # Apply sine wave targets to upper body
+                # The sine positions should be updated externally by the upper_body_controller
+                for i, idx in enumerate(self.upper_body_indices):
+                    self.dof_target[idx] = self.sine_upper_body_positions[i]
+                    
+            else:  # Default to policy control
+                # Use policy for upper body
+                for i in self.upper_body_indices:
+                    self.dof_target[i] = policy_targets[i]
+                    
+        elif self.control_mode == ControlMode.STANDUP:
+            # Use standup policy to get the robot back to standing
+            standup_targets = self.standup_policy.inference(
                 time_now=time_now,
-                dof_pos=self.dof_pos, # Use actual positions for standup
-                dof_vel=self.dof_vel, # Use actual velocities for standup
+                dof_pos=self.dof_pos,
+                dof_vel=self.dof_vel,
                 base_ang_vel=self.base_ang_vel,
                 projected_gravity=self.projected_gravity,
-                # vx, vy, vyaw are likely ignored by standup_policy.inference
+                vx=0.0,  # No velocity commands during standup
+                vy=0.0,
+                vyaw=0.0,
             )
-            # Optional: Check if standup is complete (e.g., IMU level) and transition back to WALKING or a different state
-            # if self.is_standup_complete(low_state_msg): # Requires access to low_state_msg or storing relevant parts
-            #     self.logger.info("Stand-up sequence complete. Transitioning back to WALKING (or IDLE).")
-            #     self.state = RobotState.WALKING # Or a new IDLE/READY state
-            #     # Reset policy states if needed
-        else:
-            # Should not happen if state logic above is correct, but good practice to handle
-             self.logger.warning(f"Inference called in unexpected state: {self.state}")
-             return
-
-        # Apply policy targets to lower body (always controlled by the active policy)
-        # Might need adjustment if standup policy controls arms differently
-        for i in self.lower_body_indices:
-             self.dof_target[i] = policy_targets[i]
-        
-        # Apply appropriate control to upper body based on mode
-        upper_body_mode = self.body_part_control_mode[BodyPart.UPPER_BODY]
-        
-        # If standing up, potentially override upper body control to use standup policy targets or a fixed safe pose
-        if self.state == RobotState.STANDING_UP:
-             # Example: Force upper body to follow standup policy targets (indices 0-10)
-             upper_body_targets = policy_targets[self.upper_body_indices] 
-             for i, idx in enumerate(self.upper_body_indices):
-                  self.dof_target[idx] = upper_body_targets[i]
-             # Or set to a fixed safe pose during standup
-             # safe_pose = self.standup_policy.default_dof_pos[self.upper_body_indices]
-             # for i, idx in enumerate(self.upper_body_indices):
-             #     self.dof_target[idx] = safe_pose[i]
-        elif upper_body_mode == UpperBodyControlMode.TELEOP.value:
-            # Apply manual/teleop targets to upper body (only if WALKING)
-            for i, idx in enumerate(self.upper_body_indices):
-                self.dof_target[idx] = self.manual_upper_body_positions[i]
+            
+            # Apply standup policy targets to all joints
+            # Note: StandupPolicy.inference returns values for all joints
+            if not np.all(standup_targets == 0):  # Check if standup policy returned valid targets
+                self.dof_target[:] = standup_targets
+            else:
+                self.logger.warning("Standup policy returned all zeros, using default positions")
+                self.dof_target[:] = np.array(self.cfg["common"]["default_qpos"], dtype=np.float32)
                 
-        elif upper_body_mode == UpperBodyControlMode.SINE.value:
-            # Apply sine wave targets to upper body
-            # The sine positions should be updated externally by the upper_body_controller
-            for i, idx in enumerate(self.upper_body_indices):
-                self.dof_target[idx] = self.sine_upper_body_positions[i]
-                
-        else:  # Default to policy control
-            # Use policy for upper body
-            for i in self.upper_body_indices:
-                self.dof_target[i] = policy_targets[i]
-
+        elif self.control_mode == ControlMode.IDLE:
+            # Robot has fallen but no standup requested yet
+            # Just hold the current position
+            self.dof_target[:] = self.dof_pos_latest
+            
         inference_time = time.perf_counter()
         self.logger.debug(f"Inference took {(inference_time - start_time)*1000:.4f} ms")
         time.sleep(0.001)
@@ -424,20 +399,6 @@ class Controller:
     def _publish_cmd(self):
         while self.running:
             time_now = self.timer.get_time()
-            
-            # Only advance publish time and send commands if walking or standing up
-            if self.state not in [RobotState.WALKING, RobotState.STANDING_UP]:
-                # Optional: Send damping command or zero torque when fallen/waiting
-                # for i in range(B1JointCnt):
-                #     self.low_cmd.motor_cmd[i].q = self.dof_pos_latest[i] # Hold position
-                #     self.low_cmd.motor_cmd[i].kp = 0
-                #     self.low_cmd.motor_cmd[i].dq = 0
-                #     self.low_cmd.motor_cmd[i].kd = 1.0 # Apply some damping
-                #     self.low_cmd.motor_cmd[i].tau = 0
-                # self._send_cmd(self.low_cmd) 
-                time.sleep(0.01) # Prevent busy-waiting
-                continue
-                
             if time_now < self.next_publish_time:
                 time.sleep(0.001)
                 continue
@@ -449,16 +410,10 @@ class Controller:
             for i in self.lower_body_indices:
                 self.filtered_dof_target[i] = self.filtered_dof_target[i] * 0.8 + self.dof_target[i] * 0.2
             
-            # Upper body (VR controlled) - more filtering for smoothness
             for i in self.upper_body_indices:
-                # Apply specific filtering based on the active control source
-                if self.state == RobotState.WALKING and self.body_part_control_mode[BodyPart.UPPER_BODY] == "teleop":
-                    # Stronger filtering for teleop control to be smoother
-                    # Higher first coefficient (0.9) means more of the previous value is retained
-                    # resulting in smoother, less jerky movements
+                if self.body_part_control_mode[BodyPart.UPPER_BODY] == "teleop":
                     self.filtered_dof_target[i] = self.filtered_dof_target[i] * 0.9 + self.dof_target[i] * 0.1
                 else:
-                    # Standard filtering for policy control (walking or standing up)
                     self.filtered_dof_target[i] = self.filtered_dof_target[i] * 0.8 + self.dof_target[i] * 0.2
 
             # Set position targets for all joints
@@ -476,7 +431,6 @@ class Controller:
                     -self.cfg["common"]["torque_limit"][i],
                     self.cfg["common"]["torque_limit"][i],
                 )
-                # Apply Kp based on state? Maybe 0 Kp during standup for some joints?
                 self.low_cmd.motor_cmd[i].kp = 0.0
 
             start_time = time.perf_counter()
@@ -526,35 +480,6 @@ class Controller:
         # print(f"Actual hardware joint angles: {actual_angles}")
         return actual_angles
 
-# Helper function for non-blocking keyboard input
-def listen_for_key(controller):
-    """Runs in a separate thread to listen for 's' key press."""
-    fd = sys.stdin.fileno()
-    old_settings = termios.tcgetattr(fd)
-    try:
-        tty.setraw(sys.stdin.fileno()) # Set terminal to raw mode
-        print("Input listener started. Press 's' when ready to stand up...")
-        while controller.running:
-            # Check if data is available on stdin (non-blocking)
-            if select.select([sys.stdin], [], [], 0.1) == ([sys.stdin], [], []):
-                char = sys.stdin.read(1)
-                if char == 's' and controller.state == RobotState.WAITING_FOR_STANDUP:
-                    print("\n's' key pressed. Initiating stand-up sequence.")
-                    controller.state = RobotState.STANDING_UP
-                    controller.standup_start_time = controller.timer.get_time()
-                    # Potentially reset standup policy internal state here if needed
-                    # controller.standup_policy.reset() 
-                elif ord(char) == 3: # CTRL+C
-                     print("\nCtrl+C detected in input thread. Signalling shutdown.")
-                     controller.running = False
-                     break
-            time.sleep(0.05) # Small sleep to prevent high CPU usage
-    except Exception as e:
-        print(f"\nError in keyboard listener: {e}")
-    finally:
-        termios.tcsetattr(fd, termios.TCSADRAIN, old_settings) # Restore terminal settings
-        print("Input listener stopped.")
-
 if __name__ == "__main__":
     import argparse
     import signal
@@ -582,63 +507,10 @@ if __name__ == "__main__":
         controller.start_custom_mode_conditionally()
         controller.start_rl_gait_conditionally()
 
-        # Start the keyboard listener thread
-        input_thread = threading.Thread(target=listen_for_key, args=(controller,), daemon=True)
-        input_thread.start()
-
         try:
             while controller.running:
-                # The run method now handles state-based execution
                 controller.run()
-                
-                # Check for standup success or timeout
-                if controller.state == RobotState.STANDING_UP and controller.standup_start_time is not None:
-                    current_time = controller.timer.get_time()
-                    time_since_standup_start = current_time - controller.standup_start_time
-
-                    # Check for successful stand-up
-                    if time_since_standup_start >= STANDUP_SUCCESS_DURATION_S:
-                        # Read current IMU values (already updated by _low_state_handler)
-                        # Ensure publish_lock is used if accessing shared IMU data, but current_imu_rpy is updated in low_state_handler
-                        roll_ok = abs(controller.current_imu_rpy[0]) < UPRIGHT_IMU_THRESHOLD_RP
-                        pitch_ok = abs(controller.current_imu_rpy[1]) < UPRIGHT_IMU_THRESHOLD_RP
-                        
-                        if roll_ok and pitch_ok:
-                            controller.logger.info(
-                                f"Stand-up successful! Robot is upright after {time_since_standup_start:.2f}s. "
-                                f"IMU RPY: {controller.current_imu_rpy}. Transitioning to WALKING."
-                            )
-                            controller.state = RobotState.WALKING
-                            controller.standup_start_time = None # Reset standup timer
-                            # Optionally reset walking policy if needed: controller.policy.reset_state() (if such a method exists)
-                        elif time_since_standup_start >= STANDUP_ATTEMPT_TIMEOUT_S:
-                            # Timeout for stand-up attempt
-                            controller.logger.warning(
-                                f"Stand-up attempt timed out after {time_since_standup_start:.2f}s. "
-                                f"IMU RPY: {controller.current_imu_rpy}. Transitioning back to FALLEN."
-                            )
-                            controller.state = RobotState.FALLEN
-                            controller.fall_detected_time = current_time # Reset fall time for next 5s wait
-                            controller.standup_start_time = None # Reset standup timer
-                    
-                    # Fallback: Original timeout logic (kept if success check is earlier or different)
-                    # elif time_since_standup_start > STANDUP_ATTEMPT_TIMEOUT_S: # Adjusted from 15.0
-                    #      print(f"Stand-up sequence timed out after {STANDUP_ATTEMPT_TIMEOUT_S} seconds.")
-                    #      controller.state = RobotState.FALLEN 
-                    #      controller.fall_detected_time = controller.timer.get_time() 
-                    #      controller.standup_start_time = None
-
-            # If loop exits due to controller.running = False (e.g., Ctrl+C)
-            print("Main loop exited. Setting robot to Damping mode.")
             controller.client.ChangeMode(RobotMode.kDamping)
-
         except KeyboardInterrupt:
-            print("\nKeyboard interrupt received in main thread. Cleaning up...")
-            controller.running = False # Signal threads to stop
-            # controller.cleanup() is handled by __exit__
-        finally:
-             if input_thread.is_alive():
-                  print("Waiting for input thread to finish...")
-                  input_thread.join(timeout=1.0) # Wait briefly for thread cleanup
-
-    print("Program finished.")
+            print("\nKeyboard interrupt received. Cleaning up...")
+            controller.cleanup()

@@ -31,7 +31,7 @@ UPPER_BODY_CONTROL_MODE = "teleop"  # Default to policy control
 # Control parameter for arm gains
 # Lower value means smoother movements with less stiffness
 # Range: 0.1 (very soft) to 1.0 (full stiffness)
-ARM_STIFFNESS_FACTOR = 0.2 * 1.25 * 1.25 # * 1.25
+ARM_STIFFNESS_FACTOR = 0.2 * 1.25 * 1.25 * 1.25 * 1.25
 
 class BodyPart(Enum):
     LOWER_BODY = 0  # Legs and torso
