@@ -115,7 +115,7 @@ terrain:
 commands:
   num_commands: 3 # default: lin_vel_x, lin_vel_y, ang_vel_yaw
   still_proportion: 0.1
-  lin_vel_x: [-1.0, 1.0] # min max [m/s]
+  lin_vel_x: [-2.0, 2.0] # min max [m/s]
   lin_vel_y: [-1.0, 1.0] # min max [m/s]
   ang_vel_yaw: [-1, 1]   # min max [rad/s]
   resampling_time_s: [8., 12.]

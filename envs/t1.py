@@ -25,6 +25,7 @@ class T1(BaseTask):
 
     def __init__(self, cfg):
         super().__init__(cfg)
+        print(f"Configured lin_vel_x range: {cfg['commands']['lin_vel_x']}")
         self._create_envs()
         self.gym.prepare_sim(self.sim)
         self._init_buffers()
