@@ -8,6 +8,8 @@ import argparse
 from typing import Dict, Any, Optional
 from collections import deque
 import numpy as np
+from concurrent.futures import ThreadPoolExecutor
+import queue
 
 # Global variables for teleoperation
 teleop_active = False
@@ -22,6 +24,28 @@ arm_stiffness_factor = 1.5  # Downscale arm stiffness by 0.8
 # Joint position smoothing parameters
 joint_smoothing_factor = 0.8  # How much to keep of previous value (0.0 = no smoothing, 0.9 = heavy smoothing)
 filtered_joint_positions = {}  # Store smoothed joint positions
+
+# Simple finger command timing
+last_finger_command_time = 0.0
+finger_command_interval = 0.05  # 20Hz - faster than before but slower than 100Hz
+
+# More reasonable thresholds - allow normal movements but filter small noise
+finger_command_threshold = 150  # 15% of range - allows normal movements
+last_finger_positions = {'left': {}, 'right': {}}  # Track last commanded positions per finger per hand
+smoothed_finger_positions = {'left': {}, 'right': {}}  # Track smoothed finger positions  
+finger_smoothing_factor = 0.2  # Light smoothing to filter noise but stay responsive
+
+# Per-finger timing to prevent rapid commands to same finger
+finger_last_command_time = {'left': {}, 'right': {}}  # Track last command time per finger
+finger_min_interval = 0.08  # Minimum 200ms between commands to same finger (much more reasonable)
+
+# Finger feedback tracking to prevent vibrations
+actual_finger_positions = {'left': {}, 'right': {}}  # Track actual finger positions from robot
+finger_settled_positions = {'left': {}, 'right': {}}  # Track where fingers have settled
+finger_settlement_threshold = 20  # If finger moves less than this, consider it "settled"
+finger_settlement_tolerance = 50  # If commanded vs actual position is within this, stop commanding
+last_hand_data_read_time = 0.0
+hand_data_read_interval = 0.1  # Read hand positions every 100ms
 
 # Latency tracking variables
 latency_window_size = 100  # Track last 100 messages for latency stats
@@ -191,8 +215,8 @@ def hand_oscillation(client: B1LocoClient):
     read_hand_data(B1HandIndex.kRightHand, 1.0)
     read_hand_data(B1HandIndex.kLeftHand, 1.0)
 
-    # Base positions for each finger (from original scissor position)
-    base_positions = [200, 400, 600, 800, 1000, 100]
+    # Base positions for each finger - starting with everything open (high angles)
+    base_positions = [900, 850, 800, 850, 900, 950]
     
     # Sinusoidal parameters
     amplitude = 300  # How much the fingers oscillate
@@ -200,7 +224,7 @@ def hand_oscillation(client: B1LocoClient):
     duration = 10.0  # Total duration in seconds
     
     print(f"Starting sinusoidal hand movement on BOTH hands for {duration} seconds...")
-    print("Using maximum speed, minimum force, with increased delay")
+    print("Using maximum speed, low force (10), starting with fingers open")
     print("Press Ctrl+C to stop early")
     
     start_time = time.time()
@@ -226,7 +250,7 @@ def hand_oscillation(client: B1LocoClient):
                 finger_param = DexterousFingerParameter()
                 finger_param.seq = i
                 finger_param.angle = int(target_angle)
-                finger_param.force = 1000  # Minimum force
+                finger_param.force = 10  # Low force as requested
                 finger_param.speed = 1000  # Maximum speed
                 finger_params.append(finger_param)
             
@@ -260,6 +284,98 @@ def hand_oscillation(client: B1LocoClient):
     read_hand_data(B1HandIndex.kRightHand, 1.0)
     read_hand_data(B1HandIndex.kLeftHand, 1.0)
 
+def close_hands(client: B1LocoClient):
+    """Close all fingers on both hands"""
+    print("Reading hand data for both hands...")
+    read_hand_data(B1HandIndex.kRightHand, 1.0)
+    read_hand_data(B1HandIndex.kLeftHand, 1.0)
+    
+    # Closed positions for each finger (low angles = closed)
+    closed_positions = [100, 150, 200, 150, 100, 50]  # Tight fist positions
+    
+    print("Closing all fingers on BOTH hands...")
+    print("Using maximum speed, low force (10)")
+    
+    finger_params = []
+    
+    # Set closed angles for each finger
+    for i in range(6):
+        finger_param = DexterousFingerParameter()
+        finger_param.seq = i
+        finger_param.angle = closed_positions[i]
+        finger_param.force = 10  # Low force as requested
+        finger_param.speed = 1000  # Maximum speed
+        finger_params.append(finger_param)
+    
+    # Send command to RIGHT hand
+    res_right = client.ControlDexterousHand(finger_params, B1HandIndex.kRightHand)
+    if res_right != 0:
+        print(f"Right hand close command failed: error = {res_right}")
+    else:
+        print("✅ Right hand closed successfully")
+    
+    # Send command to LEFT hand
+    res_left = client.ControlDexterousHand(finger_params, B1HandIndex.kLeftHand)
+    if res_left != 0:
+        print(f"Left hand close command failed: error = {res_left}")
+    else:
+        print("✅ Left hand closed successfully")
+    
+    # Print final angles
+    angles_str = ", ".join([f"{p.angle}" for p in finger_params])
+    print(f"Final closed positions: [{angles_str}]")
+    
+    print("Hand closing completed on both hands")
+    print("Reading final hand data...")
+    read_hand_data(B1HandIndex.kRightHand, 1.0)
+    read_hand_data(B1HandIndex.kLeftHand, 1.0)
+
+def open_hands(client: B1LocoClient):
+    """Open all fingers on both hands"""
+    print("Reading hand data for both hands...")
+    read_hand_data(B1HandIndex.kRightHand, 1.0)
+    read_hand_data(B1HandIndex.kLeftHand, 1.0)
+    
+    # Open positions for each finger (high angles = open)
+    open_positions = [900, 850, 800, 850, 900, 950]  # Fully open positions
+    
+    print("Opening all fingers on BOTH hands...")
+    print("Using maximum speed, low force (10)")
+    
+    finger_params = []
+    
+    # Set open angles for each finger
+    for i in range(6):
+        finger_param = DexterousFingerParameter()
+        finger_param.seq = i
+        finger_param.angle = open_positions[i]
+        finger_param.force = 10  # Low force as requested
+        finger_param.speed = 1000  # Maximum speed
+        finger_params.append(finger_param)
+    
+    # Send command to RIGHT hand
+    res_right = client.ControlDexterousHand(finger_params, B1HandIndex.kRightHand)
+    if res_right != 0:
+        print(f"Right hand open command failed: error = {res_right}")
+    else:
+        print("✅ Right hand opened successfully")
+    
+    # Send command to LEFT hand
+    res_left = client.ControlDexterousHand(finger_params, B1HandIndex.kLeftHand)
+    if res_left != 0:
+        print(f"Left hand open command failed: error = {res_left}")
+    else:
+        print("✅ Left hand opened successfully")
+    
+    # Print final angles
+    angles_str = ", ".join([f"{p.angle}" for p in finger_params])
+    print(f"Final open positions: [{angles_str}]")
+    
+    print("Hand opening completed on both hands")
+    print("Reading final hand data...")
+    read_hand_data(B1HandIndex.kRightHand, 1.0)
+    read_hand_data(B1HandIndex.kLeftHand, 1.0)
+
 def map_joint_name_to_index(joint_name: str) -> Optional[int]:
     """Map joint name to robot joint index"""
     joint_mapping = {
@@ -276,54 +392,83 @@ def map_joint_name_to_index(joint_name: str) -> Optional[int]:
     }
     return joint_mapping.get(joint_name)
 
-def map_hand_data_to_finger_params(hand_data: Dict[str, float]) -> list:
-    """Map hand joint data to finger parameters"""
-    finger_params = []
+def update_actual_finger_positions():
+    """This function is no longer needed with the simplified approach"""
+    pass
+
+def map_hand_data_to_finger_params(hand_data: Dict[str, float], hand_side: str) -> list:
+    """Map hand joint data to finger parameters with conservative thresholds and per-finger timing"""
+    global finger_command_threshold, last_finger_positions, smoothed_finger_positions, finger_smoothing_factor
+    global finger_last_command_time, finger_min_interval
     
-    # Map hand joint names to finger sequences
-    # According to hands_doc.md: 0=little, 1=ring, 2=middle, 3=index, 4=thumb_bend, 5=thumb_rot
-    # From the example data, we have specific MCP joint names
+    finger_params = []
+    current_time = time.time()
+    
+    # Updated mapping for new joint names (based on the WebSocket hardware interface)
     finger_mapping = {
-        # Left hand
-        "L_pinky_MCP_joint": 0,      # Little finger
-        "L_ring_MCP_joint": 1,       # Ring finger  
-        "L_middle_MCP_joint": 2,     # Middle finger
-        "L_index_MCP_joint": 3,      # Index finger
-        "L_thumb_MCP_joint2": 4,     # Thumb bending
-        "L_thumb_MCP_joint1": 5,     # Thumb rotation
-        # Right hand
-        "R_pinky_MCP_joint": 0,      # Little finger
-        "R_ring_MCP_joint": 1,       # Ring finger
-        "R_middle_MCP_joint": 2,     # Middle finger
-        "R_index_MCP_joint": 3,      # Index finger
-        "R_thumb_MCP_joint2": 4,     # Thumb bending
-        "R_thumb_MCP_joint1": 5,     # Thumb rotation
+        "thumb_proximal_yaw_joint": 5,       # Thumb rotation
+        "thumb_proximal_pitch_joint": 4,     # Thumb bending  
+        "index_proximal_joint": 3,           # Index finger
+        "middle_proximal_joint": 2,          # Middle finger
+        "ring_proximal_joint": 1,            # Ring finger
+        "pinky_proximal_joint": 0,           # Little finger
     }
     
+    # Initialize hand tracking if not exists
+    if hand_side not in last_finger_positions:
+        last_finger_positions[hand_side] = {}
+    if hand_side not in smoothed_finger_positions:
+        smoothed_finger_positions[hand_side] = {}
+    if hand_side not in finger_last_command_time:
+        finger_last_command_time[hand_side] = {}
+    
+    # Process finger data with heavy filtering and conservative thresholds
     for joint_name, joint_value in hand_data.items():
         finger_seq = finger_mapping.get(joint_name)
         
         if finger_seq is not None:
-            # Convert joint value to angle (0-1000 range)
-            # The incoming data appears to be normalized (0.0-1.0), so scale to 0-1000
-            angle = max(0, min(1000, int(joint_value * 1000)))
+            # INVERT the finger command: 1000-x (as requested)
+            inverted_value = 1000 - joint_value
+            raw_angle = max(0, min(1000, int(inverted_value)))
             
-            finger_param = DexterousFingerParameter()
-            finger_param.seq = finger_seq
-            finger_param.angle = angle
-            finger_param.force = 200  # Low force as requested
-            finger_param.speed = 1000  # Maximum speed as requested
-            finger_params.append(finger_param)
-    
-    # If no specific mapping found, create default finger params
-    if not finger_params:
-        for i in range(6):
-            finger_param = DexterousFingerParameter()
-            finger_param.seq = i
-            finger_param.angle = 500  # Middle position
-            finger_param.force = 200
-            finger_param.speed = 1000
-            finger_params.append(finger_param)
+            # Apply heavy smoothing to filter out noise
+            if finger_seq in smoothed_finger_positions[hand_side]:
+                smoothed_angle = (
+                    smoothed_finger_positions[hand_side][finger_seq] * finger_smoothing_factor + 
+                    raw_angle * (1.0 - finger_smoothing_factor)
+                )
+            else:
+                # Initialize with current value
+                smoothed_angle = raw_angle
+            
+            # Update smoothed position
+            smoothed_finger_positions[hand_side][finger_seq] = smoothed_angle
+            target_angle = int(smoothed_angle)
+            
+            # Check per-finger timing - don't command same finger too frequently
+            last_cmd_time = finger_last_command_time[hand_side].get(finger_seq, 0)
+            if (current_time - last_cmd_time) < finger_min_interval:
+                # Too soon since last command to this finger - skip
+                continue
+            
+            # Conservative threshold check - only send commands for MAJOR movements
+            last_angle = last_finger_positions[hand_side].get(finger_seq, 500)
+            change_amount = abs(target_angle - last_angle)
+            
+            if change_amount >= finger_command_threshold:
+                # Create finger command (same settings as hand_oscillation)
+                finger_param = DexterousFingerParameter()
+                finger_param.seq = finger_seq
+                finger_param.angle = target_angle
+                finger_param.force = 10  # Same as hand_oscillation
+                finger_param.speed = 1000  # Same as hand_oscillation
+                finger_params.append(finger_param)
+                
+                # Update tracking for this finger
+                last_finger_positions[hand_side][finger_seq] = target_angle
+                finger_last_command_time[hand_side][finger_seq] = current_time
+                
+                print(f"🤚 {hand_side.upper()} finger {finger_seq}: BIG MOVE {last_angle}→{target_angle} (change: {change_amount})")
     
     return finger_params
 
@@ -372,21 +517,27 @@ async def websocket_client_handler(host: str = "localhost", port: int = 8765):
                             joint_position_latencies.append(latency_ms)
                     
                     if message_type == 'joint_positions':
-                        # Extract joint data
+                        # Extract organized joint data (no fallback to all_joints)
                         message_data = data.get('data', {})
-                        all_joints = message_data.get('all_joints', {})
                         organized = message_data.get('organized', {})
                         
+                        # Validate that we have the expected organized structure
+                        if not organized:
+                            print(f"⚠️ Warning: Received joint_positions message without organized data structure")
+                            continue
+                        
+                        if 'upper_body' not in organized:
+                            print(f"⚠️ Warning: Missing 'upper_body' in organized data")
+                            continue
+                        
                         # Update latest joint data with organized structure
-                        latest_joint_data = organized.copy() if organized else all_joints.copy()
+                        latest_joint_data = organized.copy()
                         
                         # Extract hand data from organized data
-                        if organized:
-                            latest_hand_data = {
-                                'left_hand': organized.get('left_hand', {}),
-                                'right_hand': organized.get('right_hand', {})
-                            }
-                        
+                        latest_hand_data = {
+                            'left_hand': organized.get('left_hand', {}),
+                            'right_hand': organized.get('right_hand', {})
+                        }
                 except json.JSONDecodeError as e:
                     print(f"❌ JSON decode error: {e}")
                 except Exception as e:
@@ -403,8 +554,11 @@ async def websocket_client_handler(host: str = "localhost", port: int = 8765):
 def teleoperation_control_loop(client: B1LocoClient):
     """Main teleoperation control loop running at 100Hz"""
     global teleop_active, latest_joint_data, latest_hand_data, current_positions, lower_body_positions, arm_stiffness_factor
-    global joint_smoothing_factor, filtered_joint_positions
-    
+    global joint_smoothing_factor, filtered_joint_positions, last_finger_command_time, finger_command_interval
+    global finger_command_threshold, finger_deadband, last_finger_positions, smoothed_finger_positions, finger_smoothing_factor
+    global actual_finger_positions, finger_settled_positions, finger_settlement_threshold, finger_settlement_tolerance
+    global last_hand_data_read_time, hand_data_read_interval
+
     # Create low-level command publisher
     low_cmd_publisher = B1LowCmdPublisher()
     low_cmd_publisher.InitChannel()
@@ -450,12 +604,6 @@ def teleoperation_control_loop(client: B1LocoClient):
         kps[i] *= arm_stiffness_factor
         kds[i] *= arm_stiffness_factor
     
-    print("🚀 Starting teleoperation control loop at 100Hz")
-    print("   Upper body joints will follow WebSocket commands")
-    print("   Lower body joints will maintain their current positions")
-    print(f"   Arm stiffness factor: {arm_stiffness_factor} (arms only)")
-    print(f"   Joint smoothing factor: {joint_smoothing_factor} (0.0=no smoothing, 0.9=heavy smoothing)")
-    print("   Press Ctrl+C to stop teleoperation")
     
     start_time = time.time()
     command_count = 0
@@ -474,7 +622,7 @@ def teleoperation_control_loop(client: B1LocoClient):
             
             # Apply joint commands from WebSocket using organized data with smoothing
             if latest_joint_data:
-                # Use organized upper_body data if available
+                # Use organized upper_body data (no fallback needed)
                 if 'upper_body' in latest_joint_data:
                     upper_body_joints = latest_joint_data['upper_body']
                     for joint_name, joint_value in upper_body_joints.items():
@@ -482,24 +630,7 @@ def teleoperation_control_loop(client: B1LocoClient):
                         if joint_index is not None and joint_index <= 16:  # Upper body only
                             # Apply smoothing filter
                             if joint_name in filtered_joint_positions:
-                                # filteredjoint_value[i] = self.filteredjoint_value[i] * 0.8 + self.joint_value[i] * 0.2
-                                filtered_joint_positions[joint_name] = (
-                                    filtered_joint_positions[joint_name] * joint_smoothing_factor + 
-                                    joint_value * (1.0 - joint_smoothing_factor)
-                                )
-                            else:
-                                # Initialize with current value
-                                filtered_joint_positions[joint_name] = joint_value
-                            
-                            # Use filtered value for robot command
-                            low_cmd.motor_cmd[joint_index].q = filtered_joint_positions[joint_name]
-                else:
-                    # Fallback to all_joints if organized data not available
-                    for joint_name, joint_value in latest_joint_data.items():
-                        joint_index = map_joint_name_to_index(joint_name)
-                        if joint_index is not None and joint_index <= 16:  # Upper body only
-                            # Apply smoothing filter
-                            if joint_name in filtered_joint_positions:
+                                # filtered_joint_value[i] = self.filtered_joint_value[i] * 0.8 + self.joint_value[i] * 0.2
                                 filtered_joint_positions[joint_name] = (
                                     filtered_joint_positions[joint_name] * joint_smoothing_factor + 
                                     joint_value * (1.0 - joint_smoothing_factor)
@@ -519,19 +650,37 @@ def teleoperation_control_loop(client: B1LocoClient):
             # Send joint commands
             low_cmd_publisher.Write(low_cmd)
             
-            # Send hand commands
-            if latest_hand_data:
+            # Send hand commands with conservative timing and thresholds
+            current_time = time.time()
+            if latest_hand_data and (current_time - last_finger_command_time) >= finger_command_interval:
                 # Control left hand
                 if 'left_hand' in latest_hand_data and latest_hand_data['left_hand']:
-                    left_finger_params = map_hand_data_to_finger_params(latest_hand_data['left_hand'])
+                    left_finger_params = map_hand_data_to_finger_params(latest_hand_data['left_hand'], 'left')
                     if left_finger_params:
-                        client.ControlDexterousHand(left_finger_params, B1HandIndex.kLeftHand)
+                        print(f"🤚 LEFT HAND: Sending {len(left_finger_params)} finger commands at t={current_time:.3f}")
+                        for param in left_finger_params:
+                            print(f"   → LEFT finger {param.seq}: angle={param.angle}, force={param.force}, speed={param.speed}")
+                        res_left = client.ControlDexterousHand(left_finger_params, B1HandIndex.kLeftHand)
+                        if res_left != 0:
+                            print(f"❌ Left hand command failed: {res_left}")
+                        else:
+                            print(f"✅ Left hand command sent successfully")
                 
                 # Control right hand
                 if 'right_hand' in latest_hand_data and latest_hand_data['right_hand']:
-                    right_finger_params = map_hand_data_to_finger_params(latest_hand_data['right_hand'])
+                    right_finger_params = map_hand_data_to_finger_params(latest_hand_data['right_hand'], 'right')
                     if right_finger_params:
-                        client.ControlDexterousHand(right_finger_params, B1HandIndex.kRightHand)
+                        print(f"🤚 RIGHT HAND: Sending {len(right_finger_params)} finger commands at t={current_time:.3f}")
+                        for param in right_finger_params:
+                            print(f"   → RIGHT finger {param.seq}: angle={param.angle}, force={param.force}, speed={param.speed}")
+                        res_right = client.ControlDexterousHand(right_finger_params, B1HandIndex.kRightHand)
+                        if res_right != 0:
+                            print(f"❌ Right hand command failed: {res_right}")
+                        else:
+                            print(f"✅ Right hand command sent successfully")
+                
+                # Update timing
+                last_finger_command_time = current_time
             
             command_count += 1
             
@@ -550,6 +699,9 @@ def teleoperation_control_loop(client: B1LocoClient):
                 print(f"   Arm stiffness factor: {arm_stiffness_factor}")
                 print(f"   Joint smoothing factor: {joint_smoothing_factor}")
                 print(f"   Filtered joints: {len(filtered_joint_positions)}")
+                print(f"   Finger timing: {finger_command_interval:.3f}s ({1/finger_command_interval:.0f}Hz) + inversion + light smoothing + reasonable thresholds")
+                print(f"   Finger settings: inverted commands, light smoothing: {finger_smoothing_factor}, threshold: {finger_command_threshold}")
+                print(f"   Per-finger timing: min {finger_min_interval:.1f}s between commands to same finger")
                 print(f"   {latency_report}")
                 
                 # Network quality assessment for teleoperation
@@ -570,6 +722,7 @@ def teleoperation_control_loop(client: B1LocoClient):
         print("\n🛑 Teleoperation interrupted by user")
     finally:
         print("🔌 Cleaning up teleoperation resources")
+        
         low_cmd_publisher.CloseChannel()
         
         # Final statistics
@@ -587,6 +740,9 @@ def teleoperation_control_loop(client: B1LocoClient):
         print(f"   Arm stiffness factor used: {arm_stiffness_factor}")
         print(f"   Joint smoothing factor used: {joint_smoothing_factor}")
         print(f"   Total filtered joints: {len(filtered_joint_positions)}")
+        print(f"   Finger timing used: {finger_command_interval:.3f}s ({1/finger_command_interval:.0f}Hz) + inversion + light smoothing + reasonable thresholds")
+        print(f"   Finger settings: inverted commands, light smoothing: {finger_smoothing_factor}, threshold: {finger_command_threshold}")
+        print(f"   Per-finger timing: min {finger_min_interval:.1f}s between commands to same finger")
         
         # Detailed latency analysis
         print(f"\n🕐 FINAL LATENCY ANALYSIS:")
@@ -629,6 +785,14 @@ def teleoperation_control_loop(client: B1LocoClient):
         
         # Clear filtered positions for next session
         filtered_joint_positions.clear()
+        
+        # Clear finger tracking for next session
+        last_finger_positions.clear()
+        smoothed_finger_positions.clear()
+        finger_last_command_time.clear()
+        
+        # Reset timing
+        last_finger_command_time = 0.0
 
 def reset_latency_tracking():
     """Reset all latency tracking variables for a new session"""
@@ -662,7 +826,57 @@ def start_teleoperation(client: B1LocoClient, host: str = "localhost", port: int
     print("   Upper body: Following WebSocket commands")
     print("   Lower body: Maintaining current positions")
     print("   Latency tracking: Enabled (requires timestamps in messages)")
-    
+    print(f"   Finger control: {finger_command_interval:.3f}s ({1/finger_command_interval:.0f}Hz) with balanced approach")
+
+    print("Teleoperation Commands:")
+    print(f"  teleop  - Start teleoperation mode (connects to {host}:{port})")
+    print("  stop_teleop - Stop teleoperation mode")
+    print()
+    print("Movement Commands (in Walking mode):")
+    print("  w/a/s/d/q/e - Move robot")
+    print("  stop        - Stop movement")
+    print()
+    print("Head Commands:")
+    print("  hd/hu/hr/hl - Move head down/up/right/left")  
+    print("  ho          - Center head")
+    print()
+    print("Hand Commands:")
+    print("  hand - Hand oscillation")
+    print()
+    print("TELEOPERATION WORKFLOW:")
+    print("  1. First run 'mc' to prepare robot and switch to custom mode")
+    print("  2. Then run 'teleop' to start receiving WebSocket commands")
+    print(f"  3. Make sure WebSocket server is running on {host}:{port}")
+    print("  4. Upper body joints will follow WebSocket joint commands")
+    print("  5. Hand joints will follow WebSocket hand commands")
+    print("  6. Lower body joints will maintain their current positions")
+    print("  7. Latency tracking monitors network performance (requires timestamps)")
+    print("=" * 60)
+    print()
+    print("📊 TELEOPERATION FEATURES:")
+    print("  • Real-time joint position control at 100Hz")
+    print("  • Hand/finger control with inverted commands + light smoothing + reasonable thresholds") 
+    print("  • Joint position smoothing to reduce jitter")
+    print(f"  • Finger control: {finger_command_interval:.3f}s ({1/finger_command_interval:.0f}Hz) with balanced approach")
+    print("  • Per-finger timing prevents rapid-fire commands")
+    print("  • Reasonable thresholds allow normal movements while filtering noise")
+    print("  • Configurable arm stiffness scaling")
+    print("  • Network latency monitoring and quality assessment")
+    print("  • Periodic statistics reporting every 10 seconds")
+    print("=" * 60)
+    print()
+    print("🤚 FINGER CONTROL FEATURES:")
+    print("  • Balanced thresholds to allow normal movements while filtering noise")
+    print(f"  • Moderate timing: {finger_command_interval:.3f}s ({1/finger_command_interval:.0f}Hz) - balanced between responsiveness and stability")
+    print(f"  • Finger inversion: Input commands (0-1000) inverted to (1000-0) for robot")
+    print(f"  • Light smoothing (factor: {finger_smoothing_factor}) to filter out noise while staying responsive")
+    print(f"  • Reasonable threshold: {finger_command_threshold} units - allows normal movements")
+    print(f"  • Per-finger timing: minimum {finger_min_interval:.1f}s between commands to same finger")
+    print("  • Same command structure as working hand_oscillation function")
+    print("  • Force: 10, Speed: 1000 (exactly matching hand_oscillation)")
+    print("  • Unified approach for both hands (no complex per-hand logic)")
+    print("  • Prevents vibration through balanced filtering and timing")
+
     # Start WebSocket client in a separate thread
     websocket_thread = threading.Thread(
         target=lambda: asyncio.run(websocket_client_handler(host, port)),
@@ -832,12 +1046,27 @@ def main():
     print()
     print("📊 TELEOPERATION FEATURES:")
     print("  • Real-time joint position control at 100Hz")
-    print("  • Hand/finger control with low force settings") 
+    print("  • Hand/finger control with inverted commands + light smoothing + reasonable thresholds") 
     print("  • Joint position smoothing to reduce jitter")
+    print(f"  • Finger control: {finger_command_interval:.3f}s ({1/finger_command_interval:.0f}Hz) with balanced approach")
+    print("  • Per-finger timing prevents rapid-fire commands")
+    print("  • Reasonable thresholds allow normal movements while filtering noise")
     print("  • Configurable arm stiffness scaling")
     print("  • Network latency monitoring and quality assessment")
     print("  • Periodic statistics reporting every 10 seconds")
     print("=" * 60)
+    print()
+    print("🤚 FINGER CONTROL FEATURES:")
+    print("  • Balanced thresholds to allow normal movements while filtering noise")
+    print(f"  • Moderate timing: {finger_command_interval:.3f}s ({1/finger_command_interval:.0f}Hz) - balanced between responsiveness and stability")
+    print(f"  • Finger inversion: Input commands (0-1000) inverted to (1000-0) for robot")
+    print(f"  • Light smoothing (factor: {finger_smoothing_factor}) to filter out noise while staying responsive")
+    print(f"  • Reasonable threshold: {finger_command_threshold} units - allows normal movements")
+    print(f"  • Per-finger timing: minimum {finger_min_interval:.1f}s between commands to same finger")
+    print("  • Same command structure as working hand_oscillation function")
+    print("  • Force: 10, Speed: 1000 (exactly matching hand_oscillation)")
+    print("  • Unified approach for both hands (no complex per-hand logic)")
+    print("  • Prevents vibration through balanced filtering and timing")
 
     try:
         while True:
@@ -907,23 +1136,12 @@ def main():
                     yaw, pitch = 0.0, 0.0
                     need_print = True
                     res = client.RotateHead(pitch, yaw)
-                elif input_cmd == "mhel":
-                    tar_posture = Posture()
-                    tar_posture.position = Position(0.35, 0.25, 0.1)
-                    tar_posture.orientation = Orientation(-1.57, -1.57, 0.0)
-                    res = client.MoveHandEndEffectorV2(tar_posture, 2000, B1HandIndex.kLeftHand)
-                elif input_cmd == "gopenl":
-                    motion_param = GripperMotionParameter()
-                    motion_param.position = 500
-                    motion_param.force = 100
-                    motion_param.speed = 100
-                    res = client.ControlGripper(motion_param, GripperControlMode.kPosition, B1HandIndex.kLeftHand)
-                elif input_cmd == "hcm-start":
-                    res = client.SwitchHandEndEffectorControlMode(True)
-                elif input_cmd == "hcm-stop":
-                    res = client.SwitchHandEndEffectorControlMode(False)
                 elif input_cmd == "hand":
                     hand_oscillation(client)
+                elif input_cmd == "hand-open":
+                    open_hands(client)
+                elif input_cmd == "hand-close":
+                    close_hands(client)
 
                 if need_print:
                     print(f"Param: {x} {y} {z}")

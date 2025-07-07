@@ -6,8 +6,25 @@ Example WebSocket Client for MuJoCo Hardware Interface
 This client connects to the WebSocket relay server and receives all messages
 from the MuJoCo hardware interface, including joint positions and other data.
 
+Latency Measurement and Clock Synchronization:
+-----------------------------------------------
+This client measures latency by comparing message timestamps (from sender) with
+receive times (from receiver). Due to clock synchronization differences between
+systems, you may see negative latency values when the sender's clock is ahead
+of the receiver's clock.
+
+This is a normal behavior in distributed systems. By default, negative latencies
+are clamped to 0ms for statistical purposes. Use --raw-latency to see actual
+raw values for debugging clock synchronization issues.
+
+Solutions for accurate latency measurement:
+- Synchronize clocks using NTP (Network Time Protocol)
+- Use high-resolution monotonic clocks for timestamps
+- Implement dedicated latency measurement protocols
+
 Usage:
-    python example_websocket_client.py [--host HOST] [--port PORT]
+    python example_client.py [--host HOST] [--port PORT]
+    python example_client.py --raw-latency  # Show negative latencies
 """
 
 import asyncio
@@ -67,7 +84,7 @@ class WebSocketClientFrequencyMonitor:
         self.min_latency = float('inf')
         self.max_latency = 0.0
         
-    def record_message(self, message_type: str = "unknown", message_timestamp: Optional[float] = None):
+    def record_message(self, message_type: str = "unknown", message_timestamp: Optional[float] = None, raw_latency: bool = False):
         """Record a message received with optional latency calculation."""
         current_time = time.perf_counter()
         receive_time = time.time()  # Wall clock time for latency calculation
@@ -78,11 +95,28 @@ class WebSocketClientFrequencyMonitor:
             latency_s = receive_time - message_timestamp
             latency_ms = latency_s * 1000  # Convert to milliseconds
             
-            # Update latency statistics
-            self.latencies.append(latency_ms)
-            self.total_latency_sum += latency_ms
-            self.min_latency = min(self.min_latency, latency_ms)
-            self.max_latency = max(self.max_latency, latency_ms)
+            # Validate latency - negative values indicate clock synchronization issues
+            # Skip validation if raw_latency mode is enabled (for debugging)
+            if not raw_latency:
+                if latency_ms < 0:
+                    # Log warning for significant negative latencies (more than -100ms suggests real clock skew)
+                    if latency_ms < -100:
+                        logger.warning(f"⚠️  Large negative latency detected: {latency_ms:.1f}ms - "
+                                     f"sender clock may be ahead of receiver clock")
+                    # Clamp negative latencies to 0 for statistics
+                    latency_ms = 0.0
+                elif latency_ms > 10000:  # More than 10 seconds suggests timestamp error
+                    logger.warning(f"⚠️  Extremely high latency detected: {latency_ms:.1f}ms - "
+                                 f"possible timestamp format mismatch")
+                    # Don't record obviously invalid latencies
+                    latency_ms = None
+            
+            # Update latency statistics only for valid latencies
+            if latency_ms is not None:
+                self.latencies.append(latency_ms)
+                self.total_latency_sum += latency_ms
+                self.min_latency = min(self.min_latency, latency_ms)
+                self.max_latency = max(self.max_latency, latency_ms)
         
         # Record general message timing
         if self.last_message_time is not None:
@@ -247,7 +281,7 @@ class WebSocketClientFrequencyMonitor:
 class MuJoCoWebSocketClient:
     """WebSocket client for receiving MuJoCo hardware interface data."""
     
-    def __init__(self, host: str = "localhost", port: int = 8765, show_latency: bool = True):
+    def __init__(self, host: str = "localhost", port: int = 8765, show_latency: bool = True, raw_latency: bool = False):
         """Initialize the WebSocket client."""
         self.host = host
         self.port = port
@@ -256,9 +290,13 @@ class MuJoCoWebSocketClient:
         
         # Latency tracking configuration
         self.show_latency = show_latency
+        self.raw_latency = raw_latency
         
         # Initialize frequency monitor
         self.frequency_monitor = WebSocketClientFrequencyMonitor(window_size=50)
+        
+        # Clock synchronization warning flag
+        self._clock_sync_warning_shown = False
         
         # Legacy statistics (kept for backward compatibility)
         self.total_messages_received = 0
@@ -461,7 +499,11 @@ class MuJoCoWebSocketClient:
     def update_statistics(self, message_type: str, message_timestamp: Optional[float] = None):
         """Update message statistics."""
         # Use frequency monitor for accurate tracking
-        self.frequency_monitor.record_message(message_type, message_timestamp)
+        # Pass raw_latency setting to control validation
+        if hasattr(self, 'raw_latency'):
+            self.frequency_monitor.record_message(message_type, message_timestamp, self.raw_latency)
+        else:
+            self.frequency_monitor.record_message(message_type, message_timestamp)
         
         # Legacy statistics (kept for backward compatibility)
         self.total_messages_received += 1
@@ -512,6 +554,25 @@ class MuJoCoWebSocketClient:
                 if message_timestamp is not None:
                     latency_s = receive_time - message_timestamp
                     latency_ms = latency_s * 1000  # Convert to milliseconds
+                    
+                    # Validate latency - negative values indicate clock synchronization issues
+                    # Skip validation if raw_latency mode is enabled (for debugging)
+                    if not self.raw_latency:
+                        if latency_ms < 0:
+                            # Show educational warning about clock synchronization (once per session)
+                            self._show_clock_sync_warning()
+                            
+                            # Log warning for significant negative latencies (more than -100ms suggests real clock skew)
+                            if latency_ms < -100:
+                                logger.warning(f"⚠️  Large negative latency detected: {latency_ms:.1f}ms - "
+                                             f"sender clock may be ahead of receiver clock")
+                            # Clamp negative latencies to 0 for display
+                            latency_ms = 0.0
+                        elif latency_ms > 10000:  # More than 10 seconds suggests timestamp error
+                            logger.warning(f"⚠️  Extremely high latency detected: {latency_ms:.1f}ms - "
+                                         f"possible timestamp format mismatch")
+                            # Don't record obviously invalid latencies
+                            latency_ms = None
             
             # Update statistics with timestamp for latency tracking
             self.update_statistics(message_type, message_timestamp if self.show_latency else None)
@@ -694,10 +755,28 @@ class MuJoCoWebSocketClient:
             pass  # Ignore input errors
         return True
 
+    def _show_clock_sync_warning(self):
+        """Show a one-time warning about clock synchronization issues."""
+        if not self._clock_sync_warning_shown:
+            print(f"\n🕐 CLOCK SYNCHRONIZATION INFO:")
+            print(f"   Negative latency values indicate that the sender's system clock")
+            print(f"   is ahead of the receiver's system clock. This is normal in distributed")
+            print(f"   systems where machines have slightly different time synchronization.")
+            print(f"   ")
+            print(f"   Solutions:")
+            print(f"   - Use NTP (Network Time Protocol) to synchronize clocks")
+            print(f"   - Consider using high_resolution_clock() for sender timestamps")
+            print(f"   - For exact latency measurement, use synchronized hardware clocks")
+            print(f"   ")
+            print(f"   Note: Negative latencies are clamped to 0ms for statistics.")
+            print(f"   This warning will only be shown once per session.")
+            print()
+            self._clock_sync_warning_shown = True
 
-async def main_client_loop(host: str, port: int, test_mode: bool = False, frequency_report_interval: float = 10.0, frequency_window_size: int = 50, show_latency: bool = True):
+
+async def main_client_loop(host: str, port: int, test_mode: bool = False, frequency_report_interval: float = 10.0, frequency_window_size: int = 50, show_latency: bool = True, raw_latency: bool = False):
     """Main client loop."""
-    client = MuJoCoWebSocketClient(host, port, show_latency)
+    client = MuJoCoWebSocketClient(host, port, show_latency, raw_latency)
     
     # Configure frequency monitoring
     client.frequency_monitor = WebSocketClientFrequencyMonitor(window_size=frequency_window_size)
@@ -760,6 +839,8 @@ def main():
                        help="Show latency information (default: enabled)")
     parser.add_argument("--no-latency", dest="show_latency", action="store_false",
                        help="Disable latency tracking and display")
+    parser.add_argument("--raw-latency", action="store_true", default=False,
+                       help="Show raw latency values without validation (for debugging clock sync issues)")
     
     args = parser.parse_args()
     
@@ -778,6 +859,10 @@ def main():
     
     # Latency tracking configuration
     print(f"Latency tracking: {'Enabled' if args.show_latency else 'Disabled'}")
+    if args.show_latency and args.raw_latency:
+        print(f"Raw latency mode: Enabled (negative values will be shown for debugging)")
+    elif args.show_latency:
+        print(f"Latency validation: Enabled (negative values clamped to 0ms)")
     
     # Frequency monitoring configuration
     if args.no_frequency_reports:
@@ -792,7 +877,7 @@ def main():
     
     # Run the client
     try:
-        asyncio.run(main_client_loop(args.host, args.port, args.test, frequency_interval, args.frequency_window_size, args.show_latency))
+        asyncio.run(main_client_loop(args.host, args.port, args.test, frequency_interval, args.frequency_window_size, args.show_latency, args.raw_latency))
     except KeyboardInterrupt:
         print("\n👋 Goodbye!")
     except Exception as e:
