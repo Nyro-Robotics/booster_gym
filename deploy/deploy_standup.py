@@ -34,6 +34,12 @@ UPPER_BODY_CONTROL_MODE = "teleop"  # Default to policy control
 # Range: 0.1 (very soft) to 1.0 (full stiffness)
 ARM_STIFFNESS_FACTOR = 0.2 * 1.25 * 1.25 # * 1.25
 
+# Flag to show max values report
+SHOW_MAX_VALUES = False
+
+# Policy execution frequency in Hz
+POLICY_EXECUTION_HZ = 500  # Set to 50Hz
+
 class BodyPart(Enum):
     LOWER_BODY = 0  # Legs and torso
     UPPER_BODY = 1  # Arms
@@ -72,6 +78,11 @@ class Controller:
         self.remoteControlService = RemoteControlService()
         self.policy = Policy(cfg=self.cfg)
         self.standup_policy = StandupPolicy(cfg=self.cfg)
+        
+        # Timing measurements for run() method
+        self.last_run_time = None
+        self.run_latencies = []
+        self.run_hz_display_counter = 0
         
         # Control mode state
         self.control_mode = ControlMode.NORMAL
@@ -227,6 +238,11 @@ class Controller:
             time.sleep(0.1)
         create_first_frame_rl_cmd(self.low_cmd, self.cfg)
         self._send_cmd(self.low_cmd)
+        
+        # Set policy execution to 50Hz (interval = 1/50 = 0.02 seconds)
+        policy_interval = 1.0 / POLICY_EXECUTION_HZ
+        print(f"Setting policy execution rate to {POLICY_EXECUTION_HZ}Hz (interval: {policy_interval:.4f}s)")
+        
         self.next_inference_time = self.timer.get_time()
         self.next_publish_time = self.timer.get_time()
         self.publish_runner = threading.Thread(target=self._publish_cmd)
@@ -304,13 +320,46 @@ class Controller:
     
     def run(self):
         time_now = self.timer.get_time()
+        
+        # If we're not ready for the next inference, just wait
         if time_now < self.next_inference_time:
-            time.sleep(0.001)
+            time.sleep(0.001)  # Reduced sleep time for better precision
             return
+            
+        # Start measuring execution time
+        run_start_time = time.perf_counter()
+        
+        # Calculate and print frequency stats
+        if self.last_run_time is not None:
+            latency = run_start_time - self.last_run_time
+            self.run_latencies.append(latency)
+            
+            # Keep only the last 100 measurements
+            if len(self.run_latencies) > 100:
+                self.run_latencies.pop(0)
+                
+            # Print stats every 50 iterations
+            self.run_hz_display_counter += 1
+            if self.run_hz_display_counter >= 50:
+                avg_latency = sum(self.run_latencies) / len(self.run_latencies)
+                avg_hz = 1.0 / avg_latency
+                print(f"Policy execution: Avg latency={avg_latency*1000:.2f}ms, Frequency={avg_hz:.2f}Hz")
+                self.run_hz_display_counter = 0
+                
+        # Set interval to fixed 50Hz (overriding policy.get_policy_interval)
+        policy_interval = 1.0 / POLICY_EXECUTION_HZ
+        self.next_inference_time += policy_interval
+        
         self.logger.debug("-----------------------------------------------------")
-        self.next_inference_time += self.policy.get_policy_interval()
         self.logger.debug(f"Next start time: {self.next_inference_time}")
         start_time = time.perf_counter()
+        
+        # Check if we should display max values
+        if self.remoteControlService.show_max_values():
+            if hasattr(self, 'standup_policy'):
+                print("\n=== Maximum Policy Values Report ===")
+                print(self.standup_policy.get_max_values_report())
+                print("\nPress 'm' again to display updated values, 'k' to standup")
         
         # Create copies of dof_pos and dof_vel for policy inference
         masked_dof_pos = np.copy(self.dof_pos)
@@ -394,6 +443,10 @@ class Controller:
             
         inference_time = time.perf_counter()
         self.logger.debug(f"Inference took {(inference_time - start_time)*1000:.4f} ms")
+        
+        # Store the run time for next frequency calculation
+        self.last_run_time = run_start_time
+        
         time.sleep(0.001)
 
     def _publish_cmd(self):
@@ -405,16 +458,7 @@ class Controller:
             self.next_publish_time += self.cfg["common"]["dt"]
             self.logger.debug(f"Next publish time: {self.next_publish_time}")
 
-            # Apply different filtering based on body part
-            # Lower body (policy controlled) - standard filtering
-            for i in self.lower_body_indices:
-                self.filtered_dof_target[i] = self.filtered_dof_target[i] * 0.8 + self.dof_target[i] * 0.2
-            
-            for i in self.upper_body_indices:
-                if self.body_part_control_mode[BodyPart.UPPER_BODY] == "teleop":
-                    self.filtered_dof_target[i] = self.filtered_dof_target[i] * 0.9 + self.dof_target[i] * 0.1
-                else:
-                    self.filtered_dof_target[i] = self.filtered_dof_target[i] * 0.8 + self.dof_target[i] * 0.2
+            self.filtered_dof_target = self.filtered_dof_target * 0.8 + self.dof_target * 0.2
 
             # Set position targets for all joints
             for i in range(B1JointCnt):
@@ -488,6 +532,12 @@ if __name__ == "__main__":
 
     def signal_handler(sig, frame):
         print("\nShutting down...")
+        
+        # Display maximum policy values if controller is defined and has a standup policy
+        if 'controller' in globals() and hasattr(controller, 'standup_policy'):
+            print("\n=== Maximum Policy Values ===")
+            print(controller.standup_policy.get_max_values_report())
+            
         sys.exit(0)
 
     signal.signal(signal.SIGINT, signal_handler)
@@ -513,4 +563,10 @@ if __name__ == "__main__":
             controller.client.ChangeMode(RobotMode.kDamping)
         except KeyboardInterrupt:
             print("\nKeyboard interrupt received. Cleaning up...")
+            
+            # Display maximum policy values before exiting
+            if hasattr(controller, 'standup_policy'):
+                print("\n=== Maximum Policy Values ===")
+                print(controller.standup_policy.get_max_values_report())
+                
             controller.cleanup()

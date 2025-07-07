@@ -49,11 +49,12 @@ class RemoteControlService:
         self.keyboard_start_custom_mode = False
         self.keyboard_start_rl_gait = False
         self.keyboard_start_standup = False
+        self.keyboard_show_max_values = False
 
     def get_operation_hint(self) -> str:
         if hasattr(self, "joystick") and getattr(self, "joystick") != None:
             return "Left axis for forward/backward/left/right, right axis for rotation left/right"
-        return "Press 'w'/'s' to increase/decrease vx; Press 'a'/'d' to increase/decrease vy; Press 'q'/'e' to increase/decrease vyaw, press 'Space' to stop, press 'k' to stand up."
+        return "Press 'w'/'s' to increase/decrease vx; Press 'a'/'d' to increase/decrease vy; Press 'q'/'e' to increase/decrease vyaw, press 'Space' to stop, press 'k' to stand up, press 'm' to show max values."
 
     def get_custom_mode_operation_hint(self) -> str:
         if hasattr(self, "joystick") and getattr(self, "joystick") != None:
@@ -71,6 +72,7 @@ class RemoteControlService:
         self.keyboard_start_custom_mode = False
         self.keyboard_start_rl_gait = False
         self.keyboard_start_standup = False
+        self.keyboard_show_max_values = False
 
     def _start_keyboard_thread(self):
         self.keyboard_runner = threading.Thread(target=listen_keyboard, args=(self._handle_keyboard_press,))
@@ -85,6 +87,9 @@ class RemoteControlService:
         if key == "k":
             self.keyboard_start_standup = True
             print("Standup triggered")
+        if key == "m":
+            self.keyboard_show_max_values = True
+            print("Showing maximum policy values")
         if key == "w":
             old_x = self.vx
             self.vx += 0.1
@@ -184,6 +189,15 @@ class RemoteControlService:
         if standup_triggered:
             self.keyboard_start_standup = False
         return standup_triggered
+
+    def show_max_values(self) -> bool:
+        """Check if show max values key 'm' is pressed."""
+        if hasattr(self, "joystick") and getattr(self, "joystick") != None:
+            return False
+        show_max = self.keyboard_show_max_values
+        if show_max:
+            self.keyboard_show_max_values = False
+        return show_max
 
     def _run_joystick(self):
         """Poll joystick events."""

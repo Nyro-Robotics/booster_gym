@@ -32,6 +32,9 @@ class StandupPolicy:
                       f"Configured standup_num_observations ({self.num_observations}) "
                       f"does not match expected size based on num_actions ({expected_obs_size}). Using configured value.")
 
+            # Initialize tracking for maximum values
+            self._init_max_tracking()
+
         except KeyError as e:
              logger.error(f"Missing required key in config [policy] section: {e}")
              raise
@@ -40,6 +43,26 @@ class StandupPolicy:
             raise
         self._init_inference_variables()
         self.first_inference = True # Flag for initializing stacked_obs
+
+    def _init_max_tracking(self):
+        """Initialize variables to track maximum action and position differences."""
+        # Get number of joints from default_qpos
+        self.num_joints = len(self.cfg["common"]["default_qpos"])
+        
+        # Initialize tracking arrays
+        self.max_action_values = np.zeros(self.num_actions, dtype=np.float32)
+        self.max_qpos_diffs = np.zeros(self.num_joints, dtype=np.float32)
+        
+        # For tracking the raw policy actions before scaling
+        self.max_raw_actions = np.zeros(self.num_actions, dtype=np.float32)
+        
+        # Dictionary to map joint indices to names for better reporting
+        self.joint_names = {i: f"Joint_{i}" for i in range(self.num_joints)}
+        
+        # Flag to track if we've recorded any data
+        self.has_recorded_data = False
+        
+        logger.info(f"Initialized max tracking for {self.num_joints} joints and {self.num_actions} policy actions")
 
     def get_policy_interval(self):
         return self.policy_interval # Return the pre-calculated interval
@@ -54,6 +77,9 @@ class StandupPolicy:
              
         # Extract the default positions for the specific joints used by the standup policy
         self.standup_default_dof_pos_subset = full_default_dof_pos[self.standup_real_joint_indices]
+        
+        # Store full default positions for difference calculation
+        self.full_default_dof_pos = full_default_dof_pos
         
         # This stores the target positions for ALL joints controlled by the robot (e.g., 23).
         self.dof_targets = np.copy(full_default_dof_pos)
@@ -162,7 +188,9 @@ class StandupPolicy:
             # Average original and processed mirrored actions
             final_actions = 0.5 * (actions_original_numpy + actions_mirrored_processed_numpy)
 
-            logger.info(f"final_actions: {final_actions}")
+            # Update max raw actions (before clipping)
+            self._update_max_raw_actions(final_actions)
+
             # Clip and store actions for the *next* observation and for target calculation
             clip_val = norm_cfg["standup_clip_actions"]
             self.actions[:] = np.clip(final_actions, -clip_val, clip_val)
@@ -173,24 +201,84 @@ class StandupPolicy:
 
         # --- Target Calculation ---
         # Start with the full default positions for ALL joints
-        # Note: self.default_dof_pos needs to be the full 23-element array here.
-        # Let's ensure it is available, maybe store it as self.full_default_dof_pos in init.
-        # Re-fetch from cfg for clarity, or use a stored full version.
-        full_default_dof_pos = np.array(self.cfg["common"]["default_qpos"], dtype=np.float32)
-        self.dof_targets[:] = full_default_dof_pos 
-        logger.info(f"self.dof_targets: {self.dof_targets}")
+        full_default_dof_pos = self.full_default_dof_pos
+        self.dof_targets[:] = full_default_dof_pos
 
         # Apply scaled actions from policy ONLY to the specified standup joints
         action_scale = self.cfg["policy"]["control"]["action_scale"]
-        self.dof_targets[self.standup_real_joint_indices] += np.clip(action_scale * self.actions, -norm_cfg["post_action_scale_clip_actions"], norm_cfg["post_action_scale_clip_actions"])
-        logger.info(f"self.dof_targets: {self.dof_targets}")
+        scaled_actions = action_scale * self.actions
         
-        # Joints not in standup_real_joint_indices remain at their default positions.
-        # If specific behavior is needed for non-controlled joints during standup
-        # (e.g., keep head still), it would need explicit logic here.
-
-
+        # Track the maximum scaled action values (tau)
+        self._update_max_actions(scaled_actions)
+        
+        # Apply clipping after scaling
+        clipped_scaled_actions = np.clip(
+            scaled_actions, 
+            -norm_cfg["post_action_scale_clip_actions"], 
+            norm_cfg["post_action_scale_clip_actions"]
+        )
+        
+        # Apply the actions to the target positions
+        self.dof_targets[self.standup_real_joint_indices] += clipped_scaled_actions
+        
+        # Track maximum qpos differences from default
+        self._update_max_qpos_diffs(self.dof_targets, full_default_dof_pos)
+        
+        # Flag that we've recorded data
+        self.has_recorded_data = True
+        
         return self.dof_targets
+
+    def _update_max_raw_actions(self, raw_actions):
+        """Track maximum raw action values (before scaling)."""
+        self.max_raw_actions = np.maximum(self.max_raw_actions, np.abs(raw_actions))
+
+    def _update_max_actions(self, scaled_actions):
+        """Track maximum action values (tau)."""
+        self.max_action_values = np.maximum(self.max_action_values, np.abs(scaled_actions))
+
+    def _update_max_qpos_diffs(self, target_qpos, default_qpos):
+        """Track maximum differences between target qpos and default qpos."""
+        diffs = np.abs(target_qpos - default_qpos)
+        self.max_qpos_diffs = np.maximum(self.max_qpos_diffs, diffs)
+
+    def get_max_values_report(self):
+        """Return a formatted report of maximum values."""
+        if not self.has_recorded_data:
+            return "No data recorded yet."
+            
+        report = "=== STANDUP POLICY MAXIMUM VALUES REPORT ===\n"
+        
+        # Report max raw actions (before scaling)
+        report += "\nMAXIMUM RAW ACTIONS (before scaling):\n"
+        for i, max_val in enumerate(self.max_raw_actions):
+            joint_idx = self.standup_real_joint_indices[i]
+            joint_name = self.joint_names.get(joint_idx, f"Joint_{joint_idx}")
+            report += f"{joint_name} (idx {joint_idx}): {max_val:.4f}\n"
+            
+        # Report max scaled actions (tau)
+        report += "\nMAXIMUM SCALED ACTIONS (tau):\n"
+        for i, max_val in enumerate(self.max_action_values):
+            joint_idx = self.standup_real_joint_indices[i]
+            joint_name = self.joint_names.get(joint_idx, f"Joint_{joint_idx}")
+            report += f"{joint_name} (idx {joint_idx}): {max_val:.4f}\n"
+            
+        # Report max qpos differences from default
+        report += "\nMAXIMUM QPOS DIFFERENCES FROM DEFAULT:\n"
+        for i, max_diff in enumerate(self.max_qpos_diffs):
+            if max_diff > 0.001:  # Only report non-trivial differences
+                joint_name = self.joint_names.get(i, f"Joint_{i}")
+                report += f"{joint_name} (idx {i}): {max_diff:.4f} rad\n"
+                
+        return report
+        
+    def reset_max_values(self):
+        """Reset all maximum value tracking."""
+        self.max_action_values.fill(0.0)
+        self.max_qpos_diffs.fill(0.0)
+        self.max_raw_actions.fill(0.0)
+        self.has_recorded_data = False
+        logger.info("Reset all maximum value tracking")
 
     # --- Added: Mirroring Static Methods ---
     @staticmethod
