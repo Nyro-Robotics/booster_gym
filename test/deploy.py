@@ -19,7 +19,7 @@ latest_hand_data = {}
 robot_client = None
 current_positions = [0.0] * 29
 lower_body_positions = [0.0] * 12  # Joints 17-28
-arm_stiffness_factor = 1.5  # Downscale arm stiffness by 0.8
+arm_stiffness_factor = 2.0  # Downscale arm stiffness by 0.8
 
 # Joint position smoothing parameters
 joint_smoothing_factor = 0.8  # How much to keep of previous value (0.0 = no smoothing, 0.9 = heavy smoothing)
@@ -37,7 +37,7 @@ finger_smoothing_factor = 0.2  # Light smoothing to filter noise but stay respon
 
 # Per-finger timing to prevent rapid commands to same finger
 finger_last_command_time = {'left': {}, 'right': {}}  # Track last command time per finger
-finger_min_interval = 0.08  # Minimum 200ms between commands to same finger (much more reasonable)
+finger_min_interval = 0.2  # Minimum 200ms between commands to same finger (much more reasonable)
 
 # Finger feedback tracking to prevent vibrations
 actual_finger_positions = {'left': {}, 'right': {}}  # Track actual finger positions from robot
@@ -303,7 +303,7 @@ def close_hands(client: B1LocoClient):
         finger_param = DexterousFingerParameter()
         finger_param.seq = i
         finger_param.angle = closed_positions[i]
-        finger_param.force = 10  # Low force as requested
+        finger_param.force = 800  # Low force as requested
         finger_param.speed = 1000  # Maximum speed
         finger_params.append(finger_param)
     
@@ -583,8 +583,8 @@ def teleoperation_control_loop(client: B1LocoClient):
     
     base_kds = [
         0.3, 0.3,                                   # Head
-        3.0, 3.0, 3.0, 3.0, 3.0, 3.0, 3.0,         # Left arm
-        3.0, 3.0, 3.0, 3.0, 3.0, 3.0, 3.0,         # Right arm
+        1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0,         # Left arm
+        1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0,         # Right arm
         5.0,                                        # Waist
         7.5, 7.5, 3., 5.5, 0.5, 0.5,               # Left leg
         7.5, 7.5, 3., 5.5, 0.5, 0.5,               # Right leg
@@ -597,12 +597,10 @@ def teleoperation_control_loop(client: B1LocoClient):
     # Apply arm stiffness factor to left arm (joints 2-8)
     for i in range(2, 9):
         kps[i] *= arm_stiffness_factor
-        kds[i] *= arm_stiffness_factor
     
     # Apply arm stiffness factor to right arm (joints 9-15)  
     for i in range(9, 16):
         kps[i] *= arm_stiffness_factor
-        kds[i] *= arm_stiffness_factor
     
     
     start_time = time.time()
