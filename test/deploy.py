@@ -10,6 +10,7 @@ from collections import deque
 import numpy as np
 from concurrent.futures import ThreadPoolExecutor
 import queue
+import zmq
 
 # Global variables for teleoperation
 teleop_active = False
@@ -224,7 +225,6 @@ def hand_oscillation(client: B1LocoClient):
     duration = 10.0  # Total duration in seconds
     
     print(f"Starting sinusoidal hand movement on BOTH hands for {duration} seconds...")
-    print("Using maximum speed, low force (10), starting with fingers open")
     print("Press Ctrl+C to stop early")
     
     start_time = time.time()
@@ -244,8 +244,8 @@ def hand_oscillation(client: B1LocoClient):
                 sin_value = amplitude * math.sin(2 * math.pi * frequency * current_time + phase_offset)
                 target_angle = base_positions[i] + sin_value
                 
-                # Clamp angle to reasonable bounds (0-1200)
-                target_angle = max(0, min(1200, target_angle))
+                # Clamp angle to reasonable bounds (0-1000)
+                target_angle = max(0, min(1000, target_angle))
                 
                 finger_param = DexterousFingerParameter()
                 finger_param.seq = i
@@ -349,7 +349,7 @@ def open_hands(client: B1LocoClient):
         finger_param = DexterousFingerParameter()
         finger_param.seq = i
         finger_param.angle = open_positions[i]
-        finger_param.force = 10  # Low force as requested
+        finger_param.force = 800  # Low force as requested
         finger_param.speed = 1000  # Maximum speed
         finger_params.append(finger_param)
     
@@ -460,7 +460,7 @@ def map_hand_data_to_finger_params(hand_data: Dict[str, float], hand_side: str) 
                 finger_param = DexterousFingerParameter()
                 finger_param.seq = finger_seq
                 finger_param.angle = target_angle
-                finger_param.force = 10  # Same as hand_oscillation
+                finger_param.force = 800  # Same as hand_oscillation
                 finger_param.speed = 1000  # Same as hand_oscillation
                 finger_params.append(finger_param)
                 
@@ -804,112 +804,6 @@ def reset_latency_tracking():
     max_latency = 0.0
     last_latency_report_time = time.time()
 
-def start_teleoperation(client: B1LocoClient, host: str = "localhost", port: int = 8765):
-    """Start teleoperation mode"""
-    global teleop_active, teleop_thread, robot_client
-    
-    if teleop_active:
-        print("❌ Teleoperation is already active")
-        return False
-    
-    robot_client = client
-    teleop_active = True
-    
-    # Reset latency tracking for new session
-    reset_latency_tracking()
-    
-    print("🚀 Starting teleoperation mode...")
-    print(f"   WebSocket server: {host}:{port}")
-    print("   Control frequency: 100Hz")
-    print("   Upper body: Following WebSocket commands")
-    print("   Lower body: Maintaining current positions")
-    print("   Latency tracking: Enabled (requires timestamps in messages)")
-    print(f"   Finger control: {finger_command_interval:.3f}s ({1/finger_command_interval:.0f}Hz) with balanced approach")
-
-    print("Teleoperation Commands:")
-    print(f"  teleop  - Start teleoperation mode (connects to {host}:{port})")
-    print("  stop_teleop - Stop teleoperation mode")
-    print()
-    print("Movement Commands (in Walking mode):")
-    print("  w/a/s/d/q/e - Move robot")
-    print("  stop        - Stop movement")
-    print()
-    print("Head Commands:")
-    print("  hd/hu/hr/hl - Move head down/up/right/left")  
-    print("  ho          - Center head")
-    print()
-    print("Hand Commands:")
-    print("  hand - Hand oscillation")
-    print()
-    print("TELEOPERATION WORKFLOW:")
-    print("  1. First run 'mc' to prepare robot and switch to custom mode")
-    print("  2. Then run 'teleop' to start receiving WebSocket commands")
-    print(f"  3. Make sure WebSocket server is running on {host}:{port}")
-    print("  4. Upper body joints will follow WebSocket joint commands")
-    print("  5. Hand joints will follow WebSocket hand commands")
-    print("  6. Lower body joints will maintain their current positions")
-    print("  7. Latency tracking monitors network performance (requires timestamps)")
-    print("=" * 60)
-    print()
-    print("📊 TELEOPERATION FEATURES:")
-    print("  • Real-time joint position control at 100Hz")
-    print("  • Hand/finger control with inverted commands + light smoothing + reasonable thresholds") 
-    print("  • Joint position smoothing to reduce jitter")
-    print(f"  • Finger control: {finger_command_interval:.3f}s ({1/finger_command_interval:.0f}Hz) with balanced approach")
-    print("  • Per-finger timing prevents rapid-fire commands")
-    print("  • Reasonable thresholds allow normal movements while filtering noise")
-    print("  • Configurable arm stiffness scaling")
-    print("  • Network latency monitoring and quality assessment")
-    print("  • Periodic statistics reporting every 10 seconds")
-    print("=" * 60)
-    print()
-    print("🤚 FINGER CONTROL FEATURES:")
-    print("  • Balanced thresholds to allow normal movements while filtering noise")
-    print(f"  • Moderate timing: {finger_command_interval:.3f}s ({1/finger_command_interval:.0f}Hz) - balanced between responsiveness and stability")
-    print(f"  • Finger inversion: Input commands (0-1000) inverted to (1000-0) for robot")
-    print(f"  • Light smoothing (factor: {finger_smoothing_factor}) to filter out noise while staying responsive")
-    print(f"  • Reasonable threshold: {finger_command_threshold} units - allows normal movements")
-    print(f"  • Per-finger timing: minimum {finger_min_interval:.1f}s between commands to same finger")
-    print("  • Same command structure as working hand_oscillation function")
-    print("  • Force: 10, Speed: 1000 (exactly matching hand_oscillation)")
-    print("  • Unified approach for both hands (no complex per-hand logic)")
-    print("  • Prevents vibration through balanced filtering and timing")
-
-    # Start WebSocket client in a separate thread
-    websocket_thread = threading.Thread(
-        target=lambda: asyncio.run(websocket_client_handler(host, port)),
-        daemon=True
-    )
-    websocket_thread.start()
-    
-    # Start control loop in main thread
-    try:
-        teleoperation_control_loop(client)
-    except Exception as e:
-        print(f"❌ Error in teleoperation: {e}")
-    finally:
-        teleop_active = False
-        print("🔌 Teleoperation stopped")
-    
-    return True
-
-def stop_teleoperation():
-    """Stop teleoperation mode"""
-    global teleop_active
-    
-    if not teleop_active:
-        print("❌ Teleoperation is not active")
-        return False
-    
-    print("🛑 Stopping teleoperation mode...")
-    teleop_active = False
-    
-    # Give some time for threads to clean up
-    time.sleep(1.0)
-    
-    print("✅ Teleoperation stopped successfully")
-    return True
-
 def get_latency_statistics() -> Dict[str, Any]:
     """Calculate current latency statistics"""
     global message_latencies, joint_position_latencies, total_latency_sum, total_latency_count, min_latency, max_latency
@@ -987,38 +881,175 @@ def format_latency_report(stats: Dict[str, Any], detailed: bool = False) -> str:
     
     return "\n".join(lines) if lines else "🕐 Latency: Calculating..."
 
-def main():
-    if len(sys.argv) < 2:
-        print(f"Usage: {sys.argv[0]} networkInterface [--ws-host HOST] [--ws-port PORT]")
-        sys.exit(-1)
-
-    # Parse command line arguments
-    parser = argparse.ArgumentParser(description='Robot control with teleoperation')
-    parser.add_argument('network_interface', help='Network interface for robot communication')
-    parser.add_argument('--ws-host', type=str, default='localhost',
-                       help='WebSocket server host for teleoperation (default: localhost)')
-    parser.add_argument('--ws-port', type=int, default=8765,
-                       help='WebSocket server port for teleoperation (default: 8765)')
+def zeromq_subscriber_handler(zmq_address: str = "tcp://localhost:5555"):
+    """Handle ZeroMQ subscriber connection and message processing - optimized for low latency"""
+    global latest_joint_data, latest_hand_data, teleop_active
+    global message_latencies, joint_position_latencies, total_latency_sum, total_latency_count, min_latency, max_latency
     
-    args = parser.parse_args()
+    # Initialize ZeroMQ context and socket
+    context = zmq.Context()
+    socket = context.socket(zmq.SUB)
     
-    # Initialize channel with network interface
-    ChannelFactory.Instance().Init(0, args.network_interface)
+    # Optimized socket options for high-frequency, low-latency operation
+    socket.setsockopt(zmq.RCVHWM, 10)      # Very low high water mark to minimize buffering
+    socket.setsockopt(zmq.SNDHWM, 10)      # Low send high water mark
+    socket.setsockopt(zmq.RCVTIMEO, 1)     # 1ms timeout instead of 1000ms for quick polling
+    socket.setsockopt(zmq.LINGER, 0)       # Don't linger on close
+    socket.setsockopt(zmq.TCP_KEEPALIVE, 1) # Enable TCP keepalive
+    socket.setsockopt(zmq.TCP_KEEPALIVE_IDLE, 1)  # 1 second keepalive idle
+    socket.setsockopt(zmq.TCP_KEEPALIVE_INTVL, 1) # 1 second keepalive interval
+    socket.setsockopt(zmq.SUBSCRIBE, b"joint_positions")  # Subscribe to joint_positions topic
+    
+    # Create a poller for efficient message checking
+    poller = zmq.Poller()
+    poller.register(socket, zmq.POLLIN)
+    
+    try:
+        print(f"🔌 Connecting to ZeroMQ publisher at {zmq_address}")
+        socket.connect(zmq_address)
+        print(f"✅ Connected to ZeroMQ publisher successfully!")
+        print(f"🎯 Listening for teleoperation commands via ZeroMQ (optimized for low latency)...")
+        
+        message_count = 0
+        last_stats_time = time.time()
+        
+        while teleop_active:
+            try:
+                # Use poller for efficient checking (1ms timeout for responsive checking)
+                socks = dict(poller.poll(1))  # 1ms poll timeout
+                
+                if socket in socks and socks[socket] == zmq.POLLIN:
+                    # Message available - receive immediately
+                    topic, message = socket.recv_multipart(zmq.NOBLOCK)
+                    receive_time = time.time()
+                    message_count += 1
+                    
+                    # Parse JSON message
+                    data = json.loads(message.decode('utf-8'))
+                    message_type = data.get('type', 'unknown')
+                    
+                    # Calculate latency if message has timestamp
+                    latency_ms = None
+                    message_timestamp = data.get('timestamp')
+                    if message_timestamp is not None:
+                        latency_s = receive_time - message_timestamp
+                        latency_ms = latency_s * 1000  # Convert to milliseconds
+                        
+                        # Update global latency statistics
+                        message_latencies.append(latency_ms)
+                        total_latency_sum += latency_ms
+                        total_latency_count += 1
+                        min_latency = min(min_latency, latency_ms)
+                        max_latency = max(max_latency, latency_ms)
+                        
+                        # Track joint position specific latency
+                        if message_type == 'joint_positions':
+                            joint_position_latencies.append(latency_ms)
+                    
+                    if message_type == 'joint_positions':
+                        # Extract organized joint data (no fallback to all_joints)
+                        message_data = data.get('data', {})
+                        organized = message_data.get('organized', {})
+                        
+                        # Validate that we have the expected organized structure
+                        if not organized:
+                            print(f"⚠️ Warning: Received joint_positions message without organized data structure")
+                            continue
+                        
+                        if 'upper_body' not in organized:
+                            print(f"⚠️ Warning: Missing 'upper_body' in organized data")
+                            continue
+                        
+                        # Update latest joint data with organized structure
+                        latest_joint_data = organized.copy()
+                        
+                        # Extract hand data from organized data
+                        latest_hand_data = {
+                            'left_hand': organized.get('left_hand', {}),
+                            'right_hand': organized.get('right_hand', {})
+                        }
+                        
+                    # Print periodic statistics (every 5 seconds)
+                    if time.time() - last_stats_time > 5.0:
+                        msg_rate = message_count / (time.time() - last_stats_time) if (time.time() - last_stats_time) > 0 else 0
+                        print(f"⚡ ZeroMQ: {message_count} messages in {time.time() - last_stats_time:.1f}s ({msg_rate:.1f} Hz)")
+                        if latency_ms:
+                            print(f"   Current latency: {latency_ms:.1f}ms")
+                        message_count = 0
+                        last_stats_time = time.time()
+                        
+                else:
+                    # No message available - brief sleep to prevent CPU spinning
+                    time.sleep(0.0001)  # 0.1ms sleep to be CPU-friendly while staying responsive
+                    
+            except zmq.Again:
+                # No message available (shouldn't happen with poller, but just in case)
+                time.sleep(0.0001)  # 0.1ms sleep
+                continue
+            except json.JSONDecodeError as e:
+                print(f"❌ JSON decode error: {e}")
+            except Exception as e:
+                print(f"❌ Error processing ZeroMQ message: {e}")
+                
+    except Exception as e:
+        print(f"❌ ZeroMQ error: {e}")
+    finally:
+        print(f"🔌 Disconnected from ZeroMQ publisher")
+        poller.unregister(socket)
+        socket.close()
+        context.term()
 
-    client = B1LocoClient()
-    client.Init()
-    x, y, z, yaw, pitch = 0.0, 0.0, 0.0, 0.0, 0.0
-    res = 0
-    hand_action_count = 0
+def start_teleoperation(client: B1LocoClient, communication_mode: str = "websocket", 
+                      ws_host: str = "localhost", ws_port: int = 8765, 
+                      zmq_address: str = "tcp://localhost:5555"):
+    """Start teleoperation mode"""
+    global teleop_active, teleop_thread, robot_client
+    
+    if teleop_active:
+        print("❌ Teleoperation is already active")
+        return False
+    
+    robot_client = client
+    teleop_active = True
+    
+    # Reset latency tracking for new session
+    reset_latency_tracking()
+    
+    print("🚀 Starting teleoperation mode...")
+    
+    if communication_mode == "websocket":
+        print(f"   WebSocket server: {ws_host}:{ws_port}")
+        
+        # Start WebSocket client in a separate thread
+        websocket_thread = threading.Thread(
+            target=lambda: asyncio.run(websocket_client_handler(ws_host, ws_port)),
+            daemon=True
+        )
+        websocket_thread.start()
+        
+    elif communication_mode == "zeromq":
+        print(f"   ZeroMQ publisher: {zmq_address}")
+        
+        # Start ZeroMQ subscriber in a separate thread
+        zeromq_thread = threading.Thread(
+            target=lambda: zeromq_subscriber_handler(zmq_address),
+            daemon=True
+        )
+        zeromq_thread.start()
+    
+    else:
+        print(f"❌ Unknown communication mode: {communication_mode}")
+        teleop_active = False
+        return False
+    
+    print("   Control frequency: 100Hz")
+    print("   Upper body: Following commands")
+    print("   Lower body: Maintaining current positions")
+    print("   Latency tracking: Enabled (requires timestamps in messages)")
+    print(f"   Finger control: {finger_command_interval:.3f}s ({1/finger_command_interval:.0f}Hz) with balanced approach")
 
-    print("=" * 60)
-    print("ROBOT CONTROL COMMANDS:")
-    print("=" * 60)
-    print("Mode Commands:")
-    print("  mc      - Prepare robot and switch to Custom mode")
-    print()
     print("Teleoperation Commands:")
-    print(f"  teleop  - Start teleoperation mode (connects to {args.ws_host}:{args.ws_port})")
+    print(f"  teleop  - Start teleoperation mode")
     print("  stop_teleop - Stop teleoperation mode")
     print()
     print("Movement Commands (in Walking mode):")
@@ -1034,10 +1065,10 @@ def main():
     print()
     print("TELEOPERATION WORKFLOW:")
     print("  1. First run 'mc' to prepare robot and switch to custom mode")
-    print("  2. Then run 'teleop' to start receiving WebSocket commands")
-    print(f"  3. Make sure WebSocket server is running on {args.ws_host}:{args.ws_port}")
-    print("  4. Upper body joints will follow WebSocket joint commands")
-    print("  5. Hand joints will follow WebSocket hand commands")
+    print("  2. Then run 'teleop' to start receiving commands")
+    print("  3. Make sure the communication endpoint is running")
+    print("  4. Upper body joints will follow commands")
+    print("  5. Hand joints will follow hand commands")
     print("  6. Lower body joints will maintain their current positions")
     print("  7. Latency tracking monitors network performance (requires timestamps)")
     print("=" * 60)
@@ -1066,6 +1097,103 @@ def main():
     print("  • Unified approach for both hands (no complex per-hand logic)")
     print("  • Prevents vibration through balanced filtering and timing")
 
+    # Start control loop in main thread
+    try:
+        teleoperation_control_loop(client)
+    except Exception as e:
+        print(f"❌ Error in teleoperation: {e}")
+    finally:
+        teleop_active = False
+        print("🔌 Teleoperation stopped")
+    
+    return True
+
+def stop_teleoperation():
+    """Stop teleoperation mode"""
+    global teleop_active
+    
+    if not teleop_active:
+        print("❌ Teleoperation is not active")
+        return False
+    
+    print("🛑 Stopping teleoperation mode...")
+    teleop_active = False
+    
+    # Give some time for threads to clean up
+    time.sleep(1.0)
+    
+    print("✅ Teleoperation stopped successfully")
+    return True
+
+def main():
+    if len(sys.argv) < 2:
+        print(f"Usage: {sys.argv[0]} networkInterface [--communication {{'websocket', 'zeromq'}}] [--ws-host HOST] [--ws-port PORT] [--zmq-address ADDRESS]")
+        sys.exit(-1)
+
+    # Parse command line arguments
+    parser = argparse.ArgumentParser(description='Robot control with teleoperation')
+    parser.add_argument('network_interface', help='Network interface for robot communication')
+    parser.add_argument('--communication', type=str, choices=['websocket', 'zeromq'], default='websocket',
+                       help='Communication method: websocket or zeromq (default: websocket)')
+    parser.add_argument('--ws-host', type=str, default='localhost',
+                       help='WebSocket server host for teleoperation (default: localhost)')
+    parser.add_argument('--ws-port', type=int, default=8765,
+                       help='WebSocket server port for teleoperation (default: 8765)')
+    parser.add_argument('--zmq-address', type=str, default='tcp://localhost:5555',
+                       help='ZeroMQ address for teleoperation (default: tcp://localhost:5555)')
+    
+    args = parser.parse_args()
+    
+    # Initialize channel with network interface
+    ChannelFactory.Instance().Init(0, args.network_interface)
+
+    client = B1LocoClient()
+    client.Init()
+    x, y, z, yaw, pitch = 0.0, 0.0, 0.0, 0.0, 0.0
+    res = 0
+    hand_action_count = 0
+
+    print("=" * 60)
+    print("ROBOT CONTROL COMMANDS:")
+    print("=" * 60)
+    print("Mode Commands:")
+    print("  mc      - Prepare robot and switch to Custom mode")
+    print()
+    print("Teleoperation Commands:")
+    if args.communication == "websocket":
+        print(f"  teleop  - Start teleoperation mode (connects to {args.ws_host}:{args.ws_port})")
+    elif args.communication == "zeromq":
+        print(f"  teleop  - Start teleoperation mode (connects to {args.zmq_address})")
+    print("  stop_teleop - Stop teleoperation mode")
+    print()
+    print("Movement Commands (in Walking mode):")
+    print("  w/a/s/d/q/e - Move robot")
+    print("  stop        - Stop movement")
+    print()
+    print("Head Commands:")
+    print("  hd/hu/hr/hl - Move head down/up/right/left")  
+    print("  ho          - Center head")
+    print()
+    print("Hand Commands:")
+    print("  hand - Hand oscillation")
+    print()
+    print("TELEOPERATION WORKFLOW:")
+    print("  1. First run 'mc' to prepare robot and switch to custom mode")
+    print("  2. Then run 'teleop' to start receiving commands")
+    print(f"  3. Make sure the communication endpoint is running")
+    print("  4. Upper body joints will follow commands")
+    print("  5. Hand joints will follow hand commands")
+    print("  6. Lower body joints will maintain their current positions")
+    print("  7. Latency tracking monitors network performance (requires timestamps)")
+    print("=" * 60)
+    print()
+    print("📊 COMMUNICATION METHODS:")
+    print("  • WebSocket: Traditional WebSocket communication")
+    print("  • ZeroMQ: High-performance messaging for lower latency")
+    print(f"  • Current mode: {args.communication.upper()}")
+    print("  • Both methods support latency tracking for benchmarking")
+    print("=" * 60)
+
     try:
         while True:
             need_print = False
@@ -1077,8 +1205,9 @@ def main():
                     if not success:
                         print("Failed to prepare robot for custom mode")
                 elif input_cmd == 'teleop':
-                    print(f"Starting teleoperation mode (connecting to {args.ws_host}:{args.ws_port})...")
-                    success = start_teleoperation(client, args.ws_host, args.ws_port)
+                    print(f"Starting teleoperation mode ({args.communication})...")
+                    success = start_teleoperation(client, args.communication, 
+                                                 args.ws_host, args.ws_port, args.zmq_address)
                     if not success:
                         print("Failed to start teleoperation mode")
                 elif input_cmd == 'stop_teleop':

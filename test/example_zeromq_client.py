@@ -1,192 +1,267 @@
 #!/usr/bin/env python3
 """
 Example ZeroMQ Client for MuJoCo Hardware Interface
-==================================================
+=================================================
 
-This client connects to the ZeroMQ publisher and receives all messages
-from the MuJoCo hardware interface, including joint positions and other data.
+This script demonstrates how to connect to the MuJoCo ZeroMQ hardware interface
+and receive real-time joint position data. It includes comprehensive latency tracking
+and message analysis capabilities for benchmarking performance.
 
 Usage:
-    python example_zeromq_client.py [--host HOST] [--port PORT]
+    python example_zeromq_client.py --address tcp://localhost:5555
 """
 
+import asyncio
 import json
+import signal
 import time
+import zmq
 import argparse
 import sys
-import signal
-import logging
-import numpy as np
-import zmq
-from zmq.error import ZMQError
-from typing import Dict, Any, Optional
+import threading
 from datetime import datetime
 from collections import deque
+from typing import Dict, List, Any, Union, Optional
+import numpy as np
 
-# Configure logging
-logging.basicConfig(
-    level=logging.INFO, 
-    format='%(asctime)s - %(levelname)s - %(name)s - %(message)s'
-)
-logger = logging.getLogger(__name__)
+# Global flag for graceful shutdown
+running = True
 
+class JointMinMaxTracker:
+    """Track minimum and maximum values for each joint over time"""
+    
+    def __init__(self):
+        self.joint_stats = {}  # joint_name -> {'min': float, 'max': float, 'count': int}
+        self.last_update_time = time.time()
+        
+    def update_joint(self, joint_name: str, value: Union[float, int], joint_type: str = "unknown"):
+        """Update joint statistics with new value"""
+        if joint_name not in self.joint_stats:
+            self.joint_stats[joint_name] = {
+                'min': value,
+                'max': value,
+                'count': 1,
+                'type': joint_type
+            }
+        else:
+            stats = self.joint_stats[joint_name]
+            stats['min'] = min(stats['min'], value)
+            stats['max'] = max(stats['max'], value)
+            stats['count'] += 1
+            stats['type'] = joint_type
+            
+        self.last_update_time = time.time()
+    
+    def update_from_organized_data(self, organized_data: Dict[str, Dict[str, Union[float, int]]]):
+        """Update all joint statistics from organized data structure"""
+        for category, joints in organized_data.items():
+            joint_type = "arm" if category == "upper_body" else "hand"
+            if isinstance(joints, dict):
+                for joint_name, value in joints.items():
+                    self.update_joint(joint_name, value, joint_type)
+    
+    def get_stats_by_category(self) -> Dict[str, Dict]:
+        """Get statistics organized by joint category"""
+        categories = {
+            'upper_body': {},
+            'left_hand': {},
+            'right_hand': {},
+            'unknown': {}
+        }
+        
+        for joint_name, stats in self.joint_stats.items():
+            # Categorize joints based on name patterns
+            if any(x in joint_name.lower() for x in ['left_hand', 'left_finger', 'left_thumb', 'left_index', 'left_middle', 'left_ring', 'left_pinky']):
+                categories['left_hand'][joint_name] = stats
+            elif any(x in joint_name.lower() for x in ['right_hand', 'right_finger', 'right_thumb', 'right_index', 'right_middle', 'right_ring', 'right_pinky']):
+                categories['right_hand'][joint_name] = stats
+            elif any(x in joint_name.lower() for x in ['thumb', 'index', 'middle', 'ring', 'pinky']):
+                # Generic hand joints (determine by value range)
+                if stats['max'] <= 1000:
+                    categories['right_hand'][joint_name] = stats  # Assume right hand if ambiguous
+                else:
+                    categories['upper_body'][joint_name] = stats
+            else:
+                categories['upper_body'][joint_name] = stats
+        
+        return categories
+    
+    def get_summary_stats(self) -> Dict[str, Any]:
+        """Get summary statistics across all joints"""
+        if not self.joint_stats:
+            return {"total_joints": 0, "total_updates": 0}
+        
+        total_updates = sum(stats['count'] for stats in self.joint_stats.values())
+        categories = self.get_stats_by_category()
+        
+        return {
+            "total_joints": len(self.joint_stats),
+            "total_updates": total_updates,
+            "categories": {
+                "upper_body": len(categories['upper_body']),
+                "left_hand": len(categories['left_hand']),
+                "right_hand": len(categories['right_hand']),
+                "unknown": len(categories['unknown'])
+            },
+            "last_update": self.last_update_time
+        }
+    
+    def format_range_summary(self, max_joints_per_category: int = 3) -> str:
+        """Format a summary of joint ranges organized by category"""
+        categories = self.get_stats_by_category()
+        lines = []
+        
+        for category, joints in categories.items():
+            if not joints:
+                continue
+                
+            lines.append(f"📊 {category.upper()} JOINTS:")
+            
+            # Sort joints by name for consistent output
+            sorted_joints = sorted(joints.items())
+            
+            if len(sorted_joints) <= max_joints_per_category:
+                # Show all joints
+                for joint_name, stats in sorted_joints:
+                    range_val = stats['max'] - stats['min']
+                    if category in ['left_hand', 'right_hand']:
+                        lines.append(f"   {joint_name}: {stats['min']:4.0f} - {stats['max']:4.0f} (range: {range_val:4.0f}, count: {stats['count']})")
+                    else:
+                        lines.append(f"   {joint_name}: {stats['min']:6.3f} - {stats['max']:6.3f} (range: {range_val:6.3f}, count: {stats['count']})")
+            else:
+                # Show first few joints and summary
+                for joint_name, stats in sorted_joints[:max_joints_per_category]:
+                    range_val = stats['max'] - stats['min']
+                    if category in ['left_hand', 'right_hand']:
+                        lines.append(f"   {joint_name}: {stats['min']:4.0f} - {stats['max']:4.0f} (range: {range_val:4.0f}, count: {stats['count']})")
+                    else:
+                        lines.append(f"   {joint_name}: {stats['min']:6.3f} - {stats['max']:6.3f} (range: {range_val:6.3f}, count: {stats['count']})")
+                
+                remaining = len(sorted_joints) - max_joints_per_category
+                total_updates = sum(stats['count'] for stats in joints.values())
+                lines.append(f"   ... and {remaining} more joints (total updates: {total_updates})")
+        
+        return "\n".join(lines)
+    
+    def reset(self):
+        """Reset all tracking statistics"""
+        self.joint_stats.clear()
+        self.last_update_time = time.time()
 
 class ZeroMQClientFrequencyMonitor:
-    """Frequency monitor for ZeroMQ message reception."""
+    """Monitor frequency of ZeroMQ messages and track statistics"""
     
     def __init__(self, window_size: int = 50):
-        if window_size <= 0:
-            raise ValueError("Window size must be positive")
-        
         self.window_size = window_size
         self.message_times = deque(maxlen=window_size)
-        self.joint_position_times = deque(maxlen=window_size)
-        self.ping_times = deque(maxlen=window_size)
-        
-        # Latency tracking
-        self.latencies = deque(maxlen=window_size)
-        self.joint_position_latencies = deque(maxlen=window_size)
-        self.ping_latencies = deque(maxlen=window_size)
-        
-        self.last_message_time = None
-        self.last_joint_position_time = None
-        self.last_ping_time = None
+        self.message_counts = {}  # message_type -> count
         self.last_report_time = time.time()
         
-        # Counters
-        self.total_messages = 0
-        self.total_joint_positions = 0
-        self.total_pings = 0
-        self.start_time = time.time()
-        
-        # Message type tracking
-        self.message_types_count = {}
-        
-        # Latency statistics
+        # Latency tracking
+        self.latency_values = deque(maxlen=window_size)
         self.total_latency_sum = 0.0
+        self.total_latency_count = 0
         self.min_latency = float('inf')
         self.max_latency = 0.0
         
-    def record_message(self, message_type: str = "unknown", message_timestamp: Optional[float] = None):
-        """Record a message received with optional latency calculation."""
-        current_time = time.perf_counter()
-        receive_time = time.time()  # Wall clock time for latency calculation
+        # Message type tracking
+        self.joint_position_times = deque(maxlen=window_size)
+        self.joint_position_latencies = deque(maxlen=window_size)
         
-        # Calculate latency if message timestamp is provided
-        latency_ms = None
-        if message_timestamp is not None:
-            latency_s = receive_time - message_timestamp
-            latency_ms = latency_s * 1000  # Convert to milliseconds
-            
-            # Update latency statistics
-            self.latencies.append(latency_ms)
-            self.total_latency_sum += latency_ms
-            self.min_latency = min(self.min_latency, latency_ms)
-            self.max_latency = max(self.max_latency, latency_ms)
+        # Overall statistics
+        self.start_time = time.time()
+        self.total_messages = 0
+        self.total_bytes = 0
         
-        # Record general message timing
-        if self.last_message_time is not None:
-            dt = current_time - self.last_message_time
-            self.message_times.append(dt)
-        self.last_message_time = current_time
+    def record_message(self, message_type: str = "unknown", message_size: int = 0, latency_ms: Optional[float] = None):
+        """Record a message reception event"""
+        current_time = time.time()
+        self.message_times.append(current_time)
         self.total_messages += 1
+        self.total_bytes += message_size
         
-        # Track message types
-        if message_type not in self.message_types_count:
-            self.message_types_count[message_type] = 0
-        self.message_types_count[message_type] += 1
+        # Track message type
+        if message_type not in self.message_counts:
+            self.message_counts[message_type] = 0
+        self.message_counts[message_type] += 1
         
-        # Record specific message type timing and latency
-        if message_type == "joint_positions":
-            if self.last_joint_position_time is not None:
-                dt = current_time - self.last_joint_position_time
-                self.joint_position_times.append(dt)
-            self.last_joint_position_time = current_time
-            self.total_joint_positions += 1
-            
-            # Record joint position latency
+        # Track joint position messages specifically
+        if message_type == 'joint_positions':
+            self.joint_position_times.append(current_time)
             if latency_ms is not None:
                 self.joint_position_latencies.append(latency_ms)
-            
-        elif message_type == "ping":
-            if self.last_ping_time is not None:
-                dt = current_time - self.last_ping_time
-                self.ping_times.append(dt)
-            self.last_ping_time = current_time
-            self.total_pings += 1
-            
-            # Record ping latency
-            if latency_ms is not None:
-                self.ping_latencies.append(latency_ms)
+        
+        # Track latency
+        if latency_ms is not None:
+            self.latency_values.append(latency_ms)
+            self.total_latency_sum += latency_ms
+            self.total_latency_count += 1
+            self.min_latency = min(self.min_latency, latency_ms)
+            self.max_latency = max(self.max_latency, latency_ms)
     
     def get_current_frequencies(self) -> Dict:
-        """Get current frequency measurements including latency."""
-        stats = {}
+        """Calculate current message frequencies"""
+        current_time = time.time()
         
-        # Overall message frequency
-        if len(self.message_times) > 5:
-            msg_freq = 1.0 / np.mean(self.message_times)
-            msg_jitter = np.std(self.message_times) * 1000  # ms
-            stats['message_hz'] = msg_freq
-            stats['message_jitter_ms'] = msg_jitter
+        # Overall frequency
+        overall_freq = 0.0
+        if len(self.message_times) >= 2:
+            time_span = self.message_times[-1] - self.message_times[0]
+            if time_span > 0:
+                overall_freq = (len(self.message_times) - 1) / time_span
         
         # Joint position frequency
-        if len(self.joint_position_times) > 5:
-            joint_freq = 1.0 / np.mean(self.joint_position_times)
-            joint_jitter = np.std(self.joint_position_times) * 1000  # ms
-            stats['joint_position_hz'] = joint_freq
-            stats['joint_position_jitter_ms'] = joint_jitter
+        joint_freq = 0.0
+        if len(self.joint_position_times) >= 2:
+            time_span = self.joint_position_times[-1] - self.joint_position_times[0]
+            if time_span > 0:
+                joint_freq = (len(self.joint_position_times) - 1) / time_span
         
-        # Ping frequency
-        if len(self.ping_times) > 5:
-            ping_freq = 1.0 / np.mean(self.ping_times)
-            ping_jitter = np.std(self.ping_times) * 1000  # ms
-            stats['ping_hz'] = ping_freq
-            stats['ping_jitter_ms'] = ping_jitter
+        # Latency statistics
+        latency_stats = {}
+        if len(self.latency_values) > 0:
+            latencies = list(self.latency_values)
+            latency_stats = {
+                'current_avg': np.mean(latencies),
+                'current_std': np.std(latencies),
+                'current_min': np.min(latencies),
+                'current_max': np.max(latencies),
+                'current_median': np.median(latencies),
+                'window_size': len(latencies)
+            }
         
-        # Overall latency statistics
-        if len(self.latencies) > 0:
-            stats['avg_latency_ms'] = np.mean(self.latencies)
-            stats['latency_jitter_ms'] = np.std(self.latencies)
-            stats['min_latency_ms'] = np.min(self.latencies)
-            stats['max_latency_ms'] = np.max(self.latencies)
-            stats['median_latency_ms'] = np.median(self.latencies)
-        
-        # Joint position latency statistics
+        # Joint position latency
+        joint_latency_stats = {}
         if len(self.joint_position_latencies) > 0:
-            stats['joint_avg_latency_ms'] = np.mean(self.joint_position_latencies)
-            stats['joint_latency_jitter_ms'] = np.std(self.joint_position_latencies)
-            stats['joint_min_latency_ms'] = np.min(self.joint_position_latencies)
-            stats['joint_max_latency_ms'] = np.max(self.joint_position_latencies)
+            joint_latencies = list(self.joint_position_latencies)
+            joint_latency_stats = {
+                'avg': np.mean(joint_latencies),
+                'std': np.std(joint_latencies),
+                'min': np.min(joint_latencies),
+                'max': np.max(joint_latencies),
+                'count': len(joint_latencies)
+            }
         
-        # Ping latency statistics
-        if len(self.ping_latencies) > 0:
-            stats['ping_avg_latency_ms'] = np.mean(self.ping_latencies)
-            stats['ping_latency_jitter_ms'] = np.std(self.ping_latencies)
-            stats['ping_min_latency_ms'] = np.min(self.ping_latencies)
-            stats['ping_max_latency_ms'] = np.max(self.ping_latencies)
+        # Overall statistics
+        elapsed_time = current_time - self.start_time
+        avg_message_rate = self.total_messages / elapsed_time if elapsed_time > 0 else 0
+        avg_data_rate = self.total_bytes / elapsed_time if elapsed_time > 0 else 0
         
-        # Average frequencies
-        runtime = time.time() - self.start_time
-        if runtime > 0:
-            stats['avg_message_hz'] = self.total_messages / runtime
-            stats['avg_joint_position_hz'] = self.total_joint_positions / runtime
-            stats['avg_ping_hz'] = self.total_pings / runtime
-            stats['runtime_s'] = runtime
-        
-        # Overall latency statistics (lifetime)
-        if self.total_messages > 0:
-            stats['lifetime_avg_latency_ms'] = self.total_latency_sum / self.total_messages
-            stats['lifetime_min_latency_ms'] = self.min_latency if self.min_latency != float('inf') else 0
-            stats['lifetime_max_latency_ms'] = self.max_latency
-        
-        # Message type breakdown
-        stats['message_types'] = self.message_types_count.copy()
-        
-        return stats
+        return {
+            'overall_freq_hz': overall_freq,
+            'joint_freq_hz': joint_freq,
+            'latency': latency_stats,
+            'joint_latency': joint_latency_stats,
+            'message_counts': self.message_counts.copy(),
+            'total_messages': self.total_messages,
+            'total_bytes': self.total_bytes,
+            'avg_message_rate_hz': avg_message_rate,
+            'avg_data_rate_bps': avg_data_rate,
+            'elapsed_time_s': elapsed_time
+        }
     
     def should_print_report(self, interval_seconds: float = 5.0) -> bool:
-        """Check if it's time to print a frequency report."""
+        """Check if it's time to print a frequency report"""
         current_time = time.time()
         if current_time - self.last_report_time >= interval_seconds:
             self.last_report_time = current_time
@@ -194,75 +269,71 @@ class ZeroMQClientFrequencyMonitor:
         return False
     
     def print_frequency_summary(self):
-        """Print a detailed frequency summary."""
+        """Print a comprehensive frequency and latency summary"""
         stats = self.get_current_frequencies()
         
-        if 'message_hz' in stats:
-            logger.info(f"📊 ZEROMQ CLIENT FREQUENCY REPORT:")
-            logger.info(f"   Overall: {stats['message_hz']:.1f}Hz (±{stats['message_jitter_ms']:.1f}ms)")
+        print("\n" + "="*60)
+        print("📡 ZEROMQ CLIENT PERFORMANCE REPORT")
+        print("="*60)
+        print(f"Overall Message Rate: {stats['overall_freq_hz']:.1f} Hz")
+        print(f"Joint Position Rate: {stats['joint_freq_hz']:.1f} Hz")
+        print(f"Total Messages: {stats['total_messages']}")
+        print(f"Total Data: {stats['total_bytes']/1024:.1f} KB")
+        print(f"Average Data Rate: {stats['avg_data_rate_bps']/1024:.1f} KB/s")
+        print(f"Elapsed Time: {stats['elapsed_time_s']:.1f}s")
+        
+        # Latency report
+        if stats['latency']:
+            lat = stats['latency']
+            quality = "✅ Excellent" if lat['current_avg'] < 10 else "✅ Good" if lat['current_avg'] < 20 else "⚠️ Fair" if lat['current_avg'] < 50 else "❌ High"
+            print(f"\n🕐 LATENCY ANALYSIS:")
+            print(f"Current Average: {lat['current_avg']:.1f}ms (±{lat['current_std']:.1f}ms) - {quality}")
+            print(f"Current Range: {lat['current_min']:.1f} - {lat['current_max']:.1f}ms")
+            print(f"Current Median: {lat['current_median']:.1f}ms")
+            print(f"Window Size: {lat['window_size']} messages")
             
-            if 'joint_position_hz' in stats:
-                logger.info(f"   Joint Positions: {stats['joint_position_hz']:.1f}Hz (±{stats['joint_position_jitter_ms']:.1f}ms)")
-            
-            if 'ping_hz' in stats:
-                logger.info(f"   Pings: {stats['ping_hz']:.1f}Hz (±{stats['ping_jitter_ms']:.1f}ms)")
-            
-            logger.info(f"   Average Rates: Msg={stats.get('avg_message_hz', 0):.1f}Hz, "
-                       f"Joints={stats.get('avg_joint_position_hz', 0):.1f}Hz, "
-                       f"Runtime={stats.get('runtime_s', 0):.1f}s")
-            
-            # Latency information
-            if 'avg_latency_ms' in stats:
-                logger.info(f"🕐 LATENCY REPORT:")
-                logger.info(f"   Overall: {stats['avg_latency_ms']:.1f}ms avg (±{stats['latency_jitter_ms']:.1f}ms)")
-                logger.info(f"   Range: {stats['min_latency_ms']:.1f}ms min, {stats['max_latency_ms']:.1f}ms max, {stats['median_latency_ms']:.1f}ms median")
-                
-                if 'joint_avg_latency_ms' in stats:
-                    logger.info(f"   Joint Positions: {stats['joint_avg_latency_ms']:.1f}ms avg (±{stats['joint_latency_jitter_ms']:.1f}ms)")
-                    logger.info(f"     Range: {stats['joint_min_latency_ms']:.1f}-{stats['joint_max_latency_ms']:.1f}ms")
-                
-                if 'ping_avg_latency_ms' in stats:
-                    logger.info(f"   Pings: {stats['ping_avg_latency_ms']:.1f}ms avg (±{stats['ping_latency_jitter_ms']:.1f}ms)")
-                    logger.info(f"     Range: {stats['ping_min_latency_ms']:.1f}-{stats['ping_max_latency_ms']:.1f}ms")
-                
-                # Latency quality assessment
-                avg_latency = stats['avg_latency_ms']
-                if avg_latency < 10:
-                    logger.info(f"   ✅ Excellent latency (<10ms)")
-                elif avg_latency < 50:
-                    logger.info(f"   ✅ Good latency (<50ms)")
-                elif avg_latency < 100:
-                    logger.info(f"   ⚠️  Fair latency (50-100ms)")
-                else:
-                    logger.info(f"   ❌ High latency (>100ms) - possible network issues")
-            
-            # Message type breakdown
-            if 'message_types' in stats and stats['message_types']:
-                type_summary = ", ".join([f"{k}={v}" for k, v in stats['message_types'].items()])
-                logger.info(f"   Message Types: {type_summary}")
-        else:
-            logger.info("📊 ZEROMQ CLIENT: Not enough data for frequency analysis")
-
+            if self.total_latency_count > 0:
+                lifetime_avg = self.total_latency_sum / self.total_latency_count
+                lifetime_min = self.min_latency if self.min_latency != float('inf') else 0
+                print(f"Lifetime Average: {lifetime_avg:.1f}ms")
+                print(f"Lifetime Range: {lifetime_min:.1f} - {self.max_latency:.1f}ms")
+                print(f"Lifetime Count: {self.total_latency_count}")
+        
+        # Joint position latency
+        if stats['joint_latency']:
+            jlat = stats['joint_latency']
+            print(f"\n🎯 JOINT POSITION LATENCY:")
+            print(f"Average: {jlat['avg']:.1f}ms (±{jlat['std']:.1f}ms)")
+            print(f"Range: {jlat['min']:.1f} - {jlat['max']:.1f}ms")
+            print(f"Count: {jlat['count']}")
+        
+        # Message type breakdown
+        if stats['message_counts']:
+            print(f"\n📊 MESSAGE TYPES:")
+            for msg_type, count in stats['message_counts'].items():
+                percentage = (count / stats['total_messages']) * 100
+                print(f"  {msg_type}: {count} ({percentage:.1f}%)")
+        
+        print("="*60)
 
 class MuJoCoZeroMQClient:
     """ZeroMQ client for receiving MuJoCo hardware interface data."""
     
-    def __init__(self, host: str = "localhost", port: int = 5555, show_latency: bool = True):
+    def __init__(self, address: str = "tcp://localhost:5555"):
         """Initialize the ZeroMQ client."""
-        self.host = host
-        self.port = port
-        self.address = f"tcp://{host}:{port}"
+        if not address or not address.startswith(('tcp://', 'ipc://', 'inproc://')):
+            raise ValueError(f"Invalid ZeroMQ address: {address}")
         
-        # Latency tracking configuration
-        self.show_latency = show_latency
-        
-        # ZeroMQ setup
-        self.context = None
+        self.address = address
+        self.context = zmq.Context()
         self.socket = None
-        self.poller = None
+        self.is_connected = False
         
         # Initialize frequency monitor
         self.frequency_monitor = ZeroMQClientFrequencyMonitor(window_size=50)
+        
+        # Initialize min/max tracker
+        self.joint_tracker = JointMinMaxTracker()
         
         # Legacy statistics (kept for backward compatibility)
         self.total_messages_received = 0
@@ -285,13 +356,28 @@ class MuJoCoZeroMQClient:
         self.show_organized_data = True
         self.show_metadata = True
         self.show_ping_messages = True
-        self.show_raw_structure = True
+        self.show_raw_structure = True  # New option to show raw message structure
+        self.show_minmax_summary = True  # Show min/max tracking
         self.fps_display_interval = 5.0  # Show FPS every 5 seconds
         
         # Frequency reporting
         self.last_frequency_report = time.time()
         self.frequency_report_interval = 10.0  # Report every 10 seconds
-    
+        
+        # Min/max reporting
+        self.last_minmax_report = time.time()
+        self.minmax_report_interval = 15.0  # Report every 15 seconds
+        
+        # Statistics
+        self.connection_attempts = 0
+        self.message_count = 0
+        self.message_history = deque(maxlen=100)
+        self.latest_message = None
+        
+        print(f"MuJoCo ZeroMQ Client initialized")
+        print(f"Target address: {address}")
+        print("Ready to connect and receive joint position data")
+
     def analyze_message_structure(self, data: Dict[str, Any]) -> str:
         """Analyze and format the raw message structure."""
         lines = []
@@ -331,8 +417,9 @@ class MuJoCoZeroMQClient:
             analyze_value(key, value)
             
         return "\n".join(lines)
-    
-    def format_joint_positions(self, joint_data: Dict[str, float], max_joints: int = 8) -> str:
+        
+    def format_joint_positions(self, joint_data: Dict[str, Union[float, int]], max_joints: int = 8, 
+                              data_type: str = "mixed") -> str:
         """Format joint positions for display."""
         if not joint_data:
             return "No joint data"
@@ -342,17 +429,23 @@ class MuJoCoZeroMQClient:
         
         if len(sorted_joints) <= max_joints:
             # Show all joints if count is reasonable
-            joint_strs = [f"{name}: {pos:.3f}" for name, pos in sorted_joints]
+            if data_type == "hand":
+                joint_strs = [f"{name}: {pos:4d}" for name, pos in sorted_joints]
+            else:
+                joint_strs = [f"{name}: {pos:.3f}" for name, pos in sorted_joints]
             return "\n      ".join(joint_strs)
         else:
             # Show first few joints and summary for large datasets
             shown_joints = sorted_joints[:max_joints]
-            joint_strs = [f"{name}: {pos:.3f}" for name, pos in shown_joints]
+            if data_type == "hand":
+                joint_strs = [f"{name}: {pos:4d}" for name, pos in shown_joints]
+            else:
+                joint_strs = [f"{name}: {pos:.3f}" for name, pos in shown_joints]
             remaining = len(sorted_joints) - max_joints
             joint_strs.append(f"... and {remaining} more joints")
             return "\n      ".join(joint_strs)
     
-    def format_organized_data(self, organized: Dict[str, Dict[str, float]]) -> str:
+    def format_organized_data(self, organized: Dict[str, Dict[str, Union[float, int]]]) -> str:
         """Format organized joint data for display."""
         if not organized:
             return "No organized data"
@@ -361,14 +454,24 @@ class MuJoCoZeroMQClient:
         for category, joints in organized.items():
             if joints:
                 lines.append(f"     {category.replace('_', ' ').title()} ({len(joints)} joints):")
+                
+                # Determine data type for formatting
+                data_type = "hand" if "hand" in category else "upper_body"
+                
                 if len(joints) <= 3:
                     for name, pos in sorted(joints.items()):
-                        lines.append(f"       {name}: {pos:.3f}")
+                        if data_type == "hand":
+                            lines.append(f"       {name}: {pos:4d}")
+                        else:
+                            lines.append(f"       {name}: {pos:.3f}")
                 else:
                     # Show first 2 joints for large categories
                     sorted_joints = sorted(joints.items())
                     for name, pos in sorted_joints[:2]:
-                        lines.append(f"       {name}: {pos:.3f}")
+                        if data_type == "hand":
+                            lines.append(f"       {name}: {pos:4d}")
+                        else:
+                            lines.append(f"       {name}: {pos:.3f}")
                     remaining = len(joints) - 2
                     lines.append(f"       ... and {remaining} more")
         
@@ -381,8 +484,6 @@ class MuJoCoZeroMQClient:
             
         latest_msg = messages[-1]
         timestamp = latest_msg.get('timestamp', time.time())
-        receive_time = latest_msg.get('receive_time', time.time())
-        latency_ms = latest_msg.get('latency_ms')
         dt = datetime.fromtimestamp(timestamp)
         msg_type = latest_msg.get('type', 'unknown')
         
@@ -390,36 +491,6 @@ class MuJoCoZeroMQClient:
         lines.append(f"🤖 LATEST MESSAGE SUMMARY (from {len(messages)} recent messages)")
         lines.append(f"   Timestamp: {dt.strftime('%H:%M:%S.%f')[:-3]}")
         lines.append(f"   Type: {msg_type}")
-        
-        # Show latency information if available and enabled
-        if self.show_latency:
-            if latency_ms is not None:
-                if latency_ms < 10:
-                    status = "✅ Excellent"
-                elif latency_ms < 50:
-                    status = "✅ Good"
-                elif latency_ms < 100:
-                    status = "⚠️ Fair"
-                else:
-                    status = "❌ High"
-                lines.append(f"   🕐 Latency: {latency_ms:.1f}ms ({status})")
-            else:
-                lines.append(f"   🕐 Latency: No timestamp available")
-            
-            # Show buffer latency statistics if we have multiple messages
-            if len(messages) > 1:
-                buffer_latencies = [msg.get('latency_ms') for msg in messages if msg.get('latency_ms') is not None]
-                if buffer_latencies:
-                    avg_latency = sum(buffer_latencies) / len(buffer_latencies)
-                    min_latency = min(buffer_latencies)
-                    max_latency = max(buffer_latencies)
-                    lines.append(f"   📊 Buffer stats: {avg_latency:.1f}ms avg ({min_latency:.1f}-{max_latency:.1f}ms range)")
-        
-        # Show transport info
-        metadata = latest_msg.get('metadata', {})
-        transport = metadata.get('transport', 'unknown')
-        socket_type = metadata.get('socket_type', 'unknown')
-        lines.append(f"   Transport: {transport} ({socket_type})")
         
         # Show raw structure
         if self.show_raw_structure:
@@ -430,13 +501,24 @@ class MuJoCoZeroMQClient:
             message_data = latest_msg.get('data', {})
             all_joints = message_data.get('all_joints', {})
             organized = message_data.get('organized', {})
+            metadata = latest_msg.get('metadata', {})
             
-            # Show metadata
+            # Update min/max tracking from organized data
+            if organized:
+                self.joint_tracker.update_from_organized_data(organized)
+            
+            # Show metadata with VR tracking info
             if self.show_metadata and metadata:
                 lines.append(f"\n   📊 METADATA:")
                 lines.append(f"     Source: {metadata.get('source', 'unknown')}")
                 lines.append(f"     Total joints: {metadata.get('total_joint_count', 0)}")
                 lines.append(f"     Update rate: {metadata.get('update_hz', 0):.1f} Hz")
+                
+                # Show VR tracking specific info
+                hand_data_source = metadata.get('hand_data_source', 'unknown')
+                hand_data_range = metadata.get('hand_data_range', 'unknown')
+                if hand_data_source != 'unknown':
+                    lines.append(f"     Hand data: {hand_data_source} ({hand_data_range})")
                 
                 # Show joint breakdown
                 upper_count = metadata.get('upper_body_joints', 0)
@@ -445,12 +527,12 @@ class MuJoCoZeroMQClient:
                 if upper_count > 0 or left_hand_count > 0 or right_hand_count > 0:
                     lines.append(f"     Breakdown: {upper_count} upper body, {left_hand_count} left hand, {right_hand_count} right hand")
             
-            # Show organized data (more readable)
+            # Show organized data (more readable with proper formatting)
             if self.show_organized_data and organized:
                 lines.append(f"\n   📋 ORGANIZED JOINT DATA:")
                 lines.append(self.format_organized_data(organized))
             
-            # Show sample of all joints
+            # Show sample of all joints (backward compatibility)
             if self.show_full_joint_data and all_joints:
                 joint_count = len(all_joints)
                 lines.append(f"\n   🎯 SAMPLE JOINTS ({joint_count} total):")
@@ -467,14 +549,58 @@ class MuJoCoZeroMQClient:
         
         return "\n".join(lines)
     
-    def update_statistics(self, message_type: str, message_timestamp: Optional[float] = None):
+    def connect(self) -> bool:
+        """Connect to ZeroMQ publisher"""
+        self.connection_attempts += 1
+        
+        print(f"🔌 Connecting to ZeroMQ publisher at {self.address} (attempt {self.connection_attempts})")
+        
+        try:
+            # Create SUB socket
+            self.socket = self.context.socket(zmq.SUB)
+            
+            # Set socket options
+            self.socket.setsockopt(zmq.RCVHWM, 1000)  # High water mark
+            self.socket.setsockopt(zmq.RCVTIMEO, 1000)  # 1 second timeout
+            self.socket.setsockopt(zmq.SUBSCRIBE, b"joint_positions")  # Subscribe to joint_positions topic
+            
+            # Connect to publisher
+            self.socket.connect(self.address)
+            
+            # Brief pause to allow connection to establish
+            time.sleep(0.1)
+            
+            self.is_connected = True
+            print(f"✅ Connected to ZeroMQ publisher successfully!")
+            return True
+            
+        except Exception as e:
+            print(f"❌ Failed to connect to ZeroMQ publisher: {e}")
+            self.is_connected = False
+            if self.socket:
+                self.socket.close()
+                self.socket = None
+            return False
+    
+    def disconnect(self):
+        """Disconnect from ZeroMQ publisher"""
+        print("🔌 Disconnecting from ZeroMQ publisher...")
+        self.is_connected = False
+        if self.socket:
+            self.socket.close()
+            self.socket = None
+        if self.context:
+            self.context.term()
+    
+    def update_statistics(self, message_type: str, message_size: int = 0, latency_ms: Optional[float] = None):
         """Update message statistics."""
         # Use frequency monitor for accurate tracking
-        self.frequency_monitor.record_message(message_type, message_timestamp)
+        self.frequency_monitor.record_message(message_type, message_size, latency_ms)
         
         # Legacy statistics (kept for backward compatibility)
         self.total_messages_received += 1
         self.fps_message_count += 1
+        self.message_count += 1
         
         if message_type not in self.message_types_count:
             self.message_types_count[message_type] = 0
@@ -501,35 +627,48 @@ class MuJoCoZeroMQClient:
             self.frequency_monitor.print_frequency_summary()
             self.last_frequency_report = current_time
     
-    def handle_message(self, message_str: str):
-        """Handle incoming ZeroMQ message with rate limiting."""
-        receive_time = time.time()  # Capture receive time immediately for latency calculation
-        
+    def check_and_print_minmax_report(self):
+        """Check if it's time to print a min/max tracking report."""
+        current_time = time.time()
+        if (current_time - self.last_minmax_report >= self.minmax_report_interval and 
+            self.show_minmax_summary):
+            print(self.joint_tracker.format_range_summary())
+            self.last_minmax_report = current_time
+    
+    def handle_message(self, topic: bytes, message: bytes):
+        """Handle received ZeroMQ message with rate limiting."""
         try:
-            # Parse JSON
+            # Capture receive time immediately for latency calculation
+            receive_time = time.time()
+            
+            # Parse JSON message
+            message_str = message.decode('utf-8')
             data = json.loads(message_str)
             message_type = data.get('type', 'unknown')
             
-            # Extract message timestamp for latency calculation (if enabled)
-            message_timestamp = None
+            # Calculate latency if message has timestamp
             latency_ms = None
+            message_timestamp = data.get('timestamp')
+            if message_timestamp is not None:
+                latency_s = receive_time - message_timestamp
+                latency_ms = latency_s * 1000  # Convert to milliseconds
             
-            if self.show_latency:
-                message_timestamp = data.get('timestamp')
-                
-                # Calculate latency if timestamp is available
-                if message_timestamp is not None:
-                    latency_s = receive_time - message_timestamp
-                    latency_ms = latency_s * 1000  # Convert to milliseconds
+            # Update statistics with latency
+            message_size = len(message_str)
+            self.update_statistics(message_type, message_size, latency_ms)
             
-            # Update statistics with timestamp for latency tracking
-            self.update_statistics(message_type, message_timestamp if self.show_latency else None)
+            # Store message
+            self.latest_message = data
+            self.message_history.append(data)
             
-            # Add to buffer for rate-limited display with latency info
-            data['receive_time'] = receive_time
-            if self.show_latency:
-                data['latency_ms'] = latency_ms
+            # Add to buffer for rate-limited display
             self.buffered_messages.append(data)
+            
+            # Update joint tracking if this is a joint_positions message
+            if message_type == 'joint_positions':
+                message_data = data.get('data', {})
+                if 'organized' in message_data:
+                    self.joint_tracker.update_from_organized_data(message_data['organized'])
             
             # Check if it's time to print
             current_time = time.time()
@@ -543,7 +682,10 @@ class MuJoCoZeroMQClient:
                 
             # Check and print frequency report
             self.check_and_print_frequency_report()
-                
+            
+            # Check and print min/max report
+            self.check_and_print_minmax_report()
+            
         except json.JSONDecodeError as e:
             print(f"\n❌ JSON DECODE ERROR: {e}")
             print(f"   Raw message: {message_str[:200]}...")
@@ -551,79 +693,35 @@ class MuJoCoZeroMQClient:
             print(f"\n❌ MESSAGE HANDLING ERROR: {e}")
             print(f"   Raw message: {message_str[:200]}...")
     
-    def connect_and_listen(self):
-        """Connect to ZeroMQ publisher and listen for messages."""
-        try:
-            print(f"🔌 Connecting to ZeroMQ publisher at {self.address}")
-            
-            # Create ZeroMQ context and socket
-            self.context = zmq.Context()
-            self.socket = self.context.socket(zmq.SUB)
-            
-            # Subscribe to all messages (empty prefix)
-            self.socket.setsockopt_string(zmq.SUBSCRIBE, "")
-            
-            # Set socket options for better performance
-            self.socket.setsockopt(zmq.RCVHWM, 1000)  # Receive high water mark
-            self.socket.setsockopt(zmq.RCVTIMEO, 100)  # 100ms receive timeout
-            
-            # Connect to publisher
-            self.socket.connect(self.address)
-            
-            print(f"✅ Connected successfully!")
-            print(f"🎯 Listening for messages from MuJoCo hardware interface...")
-            print(f"   Displaying updates every {self.print_interval:.1f} seconds")
-            print(f"   Frequency reports every {self.frequency_report_interval:.1f} seconds")
-            print(f"   Press Ctrl+C to stop")
-            print()
-            
-            # Set up poller for non-blocking receive
-            self.poller = zmq.Poller()
-            self.poller.register(self.socket, zmq.POLLIN)
-            
-            # Listen for messages
-            while True:
-                try:
-                    # Poll for messages with timeout
-                    events = dict(self.poller.poll(timeout=100))  # 100ms timeout
-                    
-                    if self.socket in events and events[self.socket] == zmq.POLLIN:
-                        # Receive message
-                        message = self.socket.recv_string(flags=zmq.NOBLOCK)
-                        self.handle_message(message)
-                    
-                except zmq.Again:
-                    # No message available, continue polling
-                    continue
-                except KeyboardInterrupt:
-                    print(f"\n🛑 Received keyboard interrupt")
-                    break
-                    
-        except ZMQError as e:
-            print(f"❌ ZeroMQ error: {e}")
-            print(f"   Make sure the ZeroMQ publisher is running:")
-            print(f"   python ref/hardware/mujoco_zeromq_hardware.py --address tcp://*:{self.port}")
-        except Exception as e:
-            print(f"❌ Unexpected error: {e}")
-        finally:
-            print(f"\n🔌 Disconnecting from ZeroMQ publisher")
-            self.cleanup()
-    
-    def cleanup(self):
-        """Clean up ZeroMQ resources."""
-        if self.socket is not None:
-            try:
-                self.socket.close()
-            except Exception as e:
-                logger.warning(f"Error closing ZeroMQ socket: {e}")
-            self.socket = None
+    def listen_for_messages(self):
+        """Listen for messages from ZeroMQ publisher."""
+        global running
         
-        if self.context is not None:
+        print(f"🎯 Listening for messages from ZeroMQ publisher...")
+        print(f"   Displaying updates every {self.print_interval:.1f} seconds")
+        print(f"   Frequency reports every {self.frequency_report_interval:.1f} seconds")
+        print(f"   Min/Max reports every {self.minmax_report_interval:.1f} seconds")
+        print(f"   Press Ctrl+C to stop")
+        print(f"   While running, press 'f' + Enter to show frequency report")
+        print(f"   While running, press 'm' + Enter to show min/max report")
+        print()
+        
+        while running and self.is_connected:
             try:
-                self.context.term()
+                # Receive message with timeout
+                topic, message = self.socket.recv_multipart(zmq.NOBLOCK)
+                self.handle_message(topic, message)
+                
+                # Handle user input
+                if not self.handle_user_input():
+                    break
+                
+            except zmq.Again:
+                # No message available, this is expected with NOBLOCK
+                continue
             except Exception as e:
-                logger.warning(f"Error terminating ZeroMQ context: {e}")
-            self.context = None
+                print(f"❌ Error receiving message: {e}")
+                break
     
     def print_final_statistics(self):
         """Print final statistics."""
@@ -634,17 +732,22 @@ class MuJoCoZeroMQClient:
         print(f"   Total runtime: {total_time:.1f} seconds")
         print(f"   Total messages: {self.total_messages_received}")
         print(f"   Average rate: {avg_rate:.1f} messages/sec")
+        print(f"   Connection attempts: {self.connection_attempts}")
         print(f"   Message types: {self.message_types_count}")
         
         # Print final frequency monitor report
         print(f"\n📊 FINAL FREQUENCY ANALYSIS:")
         self.frequency_monitor.print_frequency_summary()
         
+        # Print final min/max tracking report
+        print(f"\n📊 FINAL MIN/MAX TRACKING:")
+        print(self.joint_tracker.format_range_summary(max_joints_per_category=10))
+        
         # Get detailed frequency stats
         stats = self.frequency_monitor.get_current_frequencies()
-        if 'joint_position_hz' in stats:
+        if 'joint_freq_hz' in stats:
             expected_hz = 150.0  # Expected from teleoperation system
-            actual_hz = stats['joint_position_hz']
+            actual_hz = stats['joint_freq_hz']
             efficiency = (actual_hz / expected_hz) * 100 if expected_hz > 0 else 0
             print(f"\n🎯 JOINT POSITION FREQUENCY ANALYSIS:")
             print(f"   Expected: {expected_hz:.1f}Hz")
@@ -655,82 +758,72 @@ class MuJoCoZeroMQClient:
             elif efficiency > 95:
                 print(f"   ✅ Good efficiency - receiving data at expected rate")
         
-        # Print detailed latency analysis
-        if hasattr(self, 'show_latency') and self.show_latency and 'avg_latency_ms' in stats:
-            print(f"\n🕐 FINAL LATENCY ANALYSIS:")
-            print(f"   Overall Average: {stats['avg_latency_ms']:.1f}ms (±{stats['latency_jitter_ms']:.1f}ms)")
-            print(f"   Overall Range: {stats['min_latency_ms']:.1f}ms - {stats['max_latency_ms']:.1f}ms")
-            print(f"   Overall Median: {stats['median_latency_ms']:.1f}ms")
-            
-            # Lifetime statistics
-            if 'lifetime_avg_latency_ms' in stats:
-                print(f"   Lifetime Average: {stats['lifetime_avg_latency_ms']:.1f}ms")
-                print(f"   Lifetime Range: {stats['lifetime_min_latency_ms']:.1f}ms - {stats['lifetime_max_latency_ms']:.1f}ms")
-            
-            # Joint position specific latency
-            if 'joint_avg_latency_ms' in stats:
-                print(f"\n   Joint Position Latency:")
-                print(f"     Average: {stats['joint_avg_latency_ms']:.1f}ms (±{stats['joint_latency_jitter_ms']:.1f}ms)")
-                print(f"     Range: {stats['joint_min_latency_ms']:.1f}ms - {stats['joint_max_latency_ms']:.1f}ms")
-                
-                # Latency quality assessment for joint data
-                joint_latency = stats['joint_avg_latency_ms']
-                if joint_latency < 10:
-                    print(f"     ✅ Excellent joint latency for real-time control")
-                elif joint_latency < 20:
-                    print(f"     ✅ Good joint latency for teleoperation")
-                elif joint_latency < 50:
-                    print(f"     ⚠️  Fair joint latency - acceptable for most tasks")
-                else:
-                    print(f"     ❌ High joint latency - may affect teleoperation quality")
-            
-            # Ping specific latency
-            if 'ping_avg_latency_ms' in stats:
-                print(f"\n   Ping Latency:")
-                print(f"     Average: {stats['ping_avg_latency_ms']:.1f}ms (±{stats['ping_latency_jitter_ms']:.1f}ms)")
-                print(f"     Range: {stats['ping_min_latency_ms']:.1f}ms - {stats['ping_max_latency_ms']:.1f}ms")
-            
-            # Network quality assessment
-            avg_latency = stats['avg_latency_ms']
-            jitter = stats['latency_jitter_ms']
-            print(f"\n   🌐 NETWORK QUALITY ASSESSMENT:")
-            if avg_latency < 10 and jitter < 5:
-                print(f"     ✅ Excellent network quality (Low latency, low jitter)")
-            elif avg_latency < 50 and jitter < 20:
-                print(f"     ✅ Good network quality")
-            elif avg_latency < 100 and jitter < 50:
-                print(f"     ⚠️  Fair network quality")
-            else:
-                print(f"     ❌ Poor network quality - high latency and/or jitter")
-                print(f"       Consider optimizing network connection")
-            
-            # ZeroMQ specific recommendations
-            print(f"\n   📋 ZEROMQ RECOMMENDATIONS:")
-            if avg_latency < 5:
-                print(f"     ✅ Excellent ZeroMQ performance - ideal for real-time applications")
-            elif avg_latency < 15:
-                print(f"     ✅ Good ZeroMQ performance - suitable for teleoperation")
-            elif avg_latency < 50:
-                print(f"     ⚠️  Fair ZeroMQ performance - consider tuning socket options")
-            else:
-                print(f"     ❌ Poor ZeroMQ performance - check network and socket configuration")
-                print(f"       Consider: adjusting HWM, using faster transport, or local networking")
-                
-        elif hasattr(self, 'show_latency') and not self.show_latency:
-            print(f"\n🕐 LATENCY ANALYSIS: Disabled (use --show-latency to enable)")
-        else:
-            print(f"\n🕐 LATENCY ANALYSIS: No timestamp data available")
+        # Print latest message summary
+        if self.message_history:
+            print(f"\n📖 LATEST MESSAGE SUMMARY:")
+            print(self.format_latest_message_summary(list(self.message_history)))
+    
+    def handle_user_input(self):
+        """Handle user keyboard input for manual commands."""
+        try:
+            # Check if input is available
+            import select
+            if select.select([sys.stdin], [], [], 0)[0]:
+                user_input = sys.stdin.readline().strip().lower()
+                if user_input == 'f':
+                    print("\n📊 MANUAL FREQUENCY REPORT:")
+                    self.frequency_monitor.print_frequency_summary()
+                    print("   (Type 'f' + Enter anytime for frequency report)")
+                elif user_input == 'm':
+                    print("\n📊 MANUAL MIN/MAX REPORT:")
+                    print(self.joint_tracker.format_range_summary(max_joints_per_category=10))
+                    print("   (Type 'm' + Enter anytime for min/max report)")
+                elif user_input == 'r':
+                    print("\n🔄 RESETTING MIN/MAX TRACKING:")
+                    self.joint_tracker.reset()
+                    print("   Min/max tracking data has been reset")
+                elif user_input == 'raw':
+                    self.show_raw_structure = not self.show_raw_structure
+                    print(f"\n🔍 Raw structure display: {'ON' if self.show_raw_structure else 'OFF'}")
+                elif user_input == 'l' or user_input == 'latest':
+                    if self.message_history:
+                        print("\n📖 LATEST MESSAGE:")
+                        print(self.format_latest_message_summary(list(self.message_history)))
+                    else:
+                        print("\n📖 No messages received yet")
+                elif user_input == 'q':
+                    print("👋 Quit command received")
+                    return False
+                elif user_input in ['j', 'joints']:
+                    print("\n🎯 JOINT STATISTICS:")
+                    range_summary = self.joint_tracker.format_range_summary()
+                    if range_summary:
+                        print(f"{range_summary}")
+                    else:
+                        print("No joint data available yet")
+                elif user_input:
+                    print(f"❓ Unknown command: '{user_input}'")
+                    print("Available commands: 'f'=frequency, 'm'=min/max, 'r'=reset, 'raw'=toggle raw, 'l'=latest, 'j'=joints, 'q'=quit")
+        except Exception:
+            pass  # Ignore input errors
+        return True
 
-
-def main_client_loop(host: str, port: int, test_mode: bool = False, 
-                     frequency_report_interval: float = 10.0, 
-                     frequency_window_size: int = 50, show_latency: bool = True):
-    """Main client loop."""
-    client = MuJoCoZeroMQClient(host, port, show_latency)
+def run_client(address: str, test_mode: bool = False, 
+              frequency_report_interval: float = 10.0, frequency_window_size: int = 50,
+              enable_minmax_tracking: bool = True, minmax_report_interval: float = 15.0):
+    """Run the ZeroMQ client."""
+    global running
+    
+    # Create client
+    client = MuJoCoZeroMQClient(address)
     
     # Configure frequency monitoring
     client.frequency_monitor = ZeroMQClientFrequencyMonitor(window_size=frequency_window_size)
     client.frequency_report_interval = frequency_report_interval
+    
+    # Configure min/max tracking
+    client.show_minmax_summary = enable_minmax_tracking
+    client.minmax_report_interval = minmax_report_interval
     
     # Configure display options
     if test_mode:
@@ -739,6 +832,7 @@ def main_client_loop(host: str, port: int, test_mode: bool = False,
         client.show_full_joint_data = False  # Reduce output in test mode
         client.fps_display_interval = 2.0  # More frequent stats in test mode
         client.frequency_report_interval = 5.0  # More frequent frequency reports in test mode
+        client.minmax_report_interval = 8.0  # More frequent min/max reports in test mode
     else:
         client.print_interval = 1.0  # Normal 1-second updates
         client.show_full_joint_data = True
@@ -753,60 +847,106 @@ def main_client_loop(host: str, port: int, test_mode: bool = False,
     print(f"   Report interval: {client.frequency_report_interval:.1f}s")
     print(f"   Window size: {client.frequency_monitor.window_size} messages")
     
-    try:
-        client.connect_and_listen()
+    if enable_minmax_tracking:
+        print(f"📊 Min/Max tracking enabled:")
+        print(f"   Report interval: {client.minmax_report_interval:.1f}s")
+    
+    # Connect to publisher
+    if not client.connect():
+        print("❌ Failed to connect to ZeroMQ publisher")
+        return False
+    
+    if test_mode:
+        print("🧪 Test mode: Will listen for a few messages then exit")
+        test_start_time = time.time()
+        test_duration = 5.0  # 5 seconds
         
-    except KeyboardInterrupt:
-        print(f"\n🛑 Received keyboard interrupt")
-    except Exception as e:
-        print(f"\n❌ Unexpected error: {e}")
-    finally:
-        client.print_final_statistics()
-
+        while running and client.is_connected and (time.time() - test_start_time) < test_duration:
+            try:
+                topic, message = client.socket.recv_multipart(zmq.NOBLOCK)
+                client.handle_message(topic, message)
+                
+                # Check for periodic reports
+                client.check_and_print_frequency_report()
+                
+                if enable_minmax_tracking:
+                    client.check_and_print_minmax_report()
+                
+            except zmq.Again:
+                continue
+            except Exception as e:
+                print(f"❌ Error in test mode: {e}")
+                break
+        
+        print("🧪 Test mode completed")
+    else:
+        # Start message listening in a separate thread
+        listen_thread = threading.Thread(target=client.listen_for_messages, daemon=True)
+        listen_thread.start()
+        
+        try:
+            while running and client.is_connected:
+                time.sleep(0.1)
+                
+        except KeyboardInterrupt:
+            print("\n🛑 Interrupted by user")
+        except Exception as e:
+            print(f"❌ Error in main loop: {e}")
+    
+    # Cleanup
+    running = False
+    client.disconnect()
+    
+    # Print final statistics
+    client.print_final_statistics()
+    
+    return True
 
 def signal_handler(signum, frame):
-    """Handle interrupt signals gracefully."""
-    print(f"\n🛑 Received signal {signum}. Shutting down...")
-    sys.exit(0)
-
+    """Handle interrupt signals"""
+    global running
+    print("\n🛑 Received interrupt signal, shutting down...")
+    running = False
 
 def main():
     """Main function."""
-    parser = argparse.ArgumentParser(description="ZeroMQ Client for MuJoCo Hardware Interface")
-    parser.add_argument("--host", type=str, default="localhost",
-                       help="ZeroMQ publisher host (default: localhost)")
-    parser.add_argument("--port", type=int, default=5555,
-                       help="ZeroMQ publisher port (default: 5555)")
-    parser.add_argument("--test", action="store_true",
-                       help="Run in test mode with reduced output and faster updates")
-    parser.add_argument("--frequency_report_interval", type=float, default=10.0,
-                       help="Frequency report interval in seconds (default: 10.0)")
-    parser.add_argument("--frequency_window_size", type=int, default=50,
-                       help="Frequency monitor window size for averaging (default: 50)")
-    parser.add_argument("--no_frequency_reports", action="store_true",
-                       help="Disable automatic frequency reports")
-    parser.add_argument("--show-latency", action="store_true", default=True,
-                       help="Show latency information (default: enabled)")
-    parser.add_argument("--no-latency", dest="show_latency", action="store_false",
-                       help="Disable latency tracking and display")
+    global running
+    
+    # Set up signal handler
+    signal.signal(signal.SIGINT, signal_handler)
+    
+    parser = argparse.ArgumentParser(description='ZeroMQ Client for MuJoCo Hardware Interface')
+    parser.add_argument('--address', type=str, default='tcp://localhost:5555',
+                       help='ZeroMQ publisher address (default: tcp://localhost:5555)')
+    parser.add_argument('--test', action='store_true',
+                       help='Run in test mode (brief connection test)')
+    parser.add_argument('--frequency_report_interval', type=float, default=10.0,
+                       help='Frequency report interval in seconds (default: 10.0)')
+    parser.add_argument('--frequency_window_size', type=int, default=50,
+                       help='Frequency calculation window size (default: 50)')
+    parser.add_argument('--no_frequency_reports', action='store_true',
+                       help='Disable automatic frequency reports')
+    parser.add_argument('--minmax_report_interval', type=float, default=15.0,
+                       help='Min/max report interval in seconds (default: 15.0)')
+    parser.add_argument('--no_minmax_tracking', action='store_true',
+                       help='Disable min/max tracking and reports')
     
     args = parser.parse_args()
     
-    # Set up signal handlers
-    signal.signal(signal.SIGINT, signal_handler)
-    signal.signal(signal.SIGTERM, signal_handler)
+    # Validate address
+    if not args.address.startswith(('tcp://', 'ipc://', 'inproc://')):
+        print(f"❌ Invalid ZeroMQ address: {args.address}")
+        print("   Address should start with tcp://, ipc://, or inproc://")
+        return 1
     
-    print("🤖 MuJoCo ZeroMQ Client")
+    print("🚀 MuJoCo ZeroMQ Client")
     print("=" * 50)
-    print(f"Connecting to: tcp://{args.host}:{args.port}")
+    print(f"Connecting to: {args.address}")
     print(f"Test mode: {args.test}")
     if args.test:
         print("Display updates: Every 0.5 seconds")
     else:
         print("Display updates: Every 1.0 seconds")
-    
-    # Latency tracking configuration
-    print(f"Latency tracking: {'Enabled' if args.show_latency else 'Disabled'}")
     
     # Frequency monitoring configuration
     if args.no_frequency_reports:
@@ -817,17 +957,45 @@ def main():
         frequency_interval = args.frequency_report_interval
     
     print(f"Frequency window: {args.frequency_window_size} messages")
+    
+    # Min/Max tracking configuration  
+    if args.no_minmax_tracking:
+        print("Min/Max tracking: Disabled")
+        enable_minmax = False
+        minmax_interval = float('inf')
+    else:
+        print(f"Min/Max reports: Every {args.minmax_report_interval:.1f}s")
+        enable_minmax = True
+        minmax_interval = args.minmax_report_interval
+        
     print("=" * 50)
     
     # Run the client
     try:
-        main_client_loop(args.host, args.port, args.test, frequency_interval, args.frequency_window_size, args.show_latency)
+        success = run_client(
+            address=args.address,
+            test_mode=args.test,
+            frequency_report_interval=frequency_interval,
+            frequency_window_size=args.frequency_window_size,
+            enable_minmax_tracking=enable_minmax,
+            minmax_report_interval=minmax_interval
+        )
+        
+        if success:
+            print("✅ ZeroMQ client completed successfully")
+            return 0
+        else:
+            print("❌ ZeroMQ client failed")
+            return 1
+            
     except KeyboardInterrupt:
         print("\n👋 Goodbye!")
+        return 0
     except Exception as e:
         print(f"\n❌ Fatal error: {e}")
-        sys.exit(1)
-
+        import traceback
+        traceback.print_exc()
+        return 1
 
 if __name__ == "__main__":
-    main() 
+    sys.exit(main()) 
