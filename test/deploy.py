@@ -388,7 +388,7 @@ def map_joint_name_to_index(joint_name: str) -> Optional[int]:
         "Right_Shoulder_Pitch": 9, "Right_Shoulder_Roll": 10, "Right_Elbow_Pitch": 11, 
         "Right_Elbow_Yaw": 12, "Right_Wrist_Pitch": 13, "Right_Wrist_Yaw": 14, "Right_Hand_Roll": 15,
         # Waist joint
-        "Trunk_Waist": 16
+        "Waist": 16
     }
     return joint_mapping.get(joint_name)
 

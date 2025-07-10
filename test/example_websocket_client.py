@@ -23,8 +23,8 @@ Solutions for accurate latency measurement:
 - Implement dedicated latency measurement protocols
 
 Usage:
-    python example_client.py [--host HOST] [--port PORT]
-    python example_client.py --raw-latency  # Show negative latencies
+    python example_websocket_client.py [--host HOST] [--port PORT]
+    python example_websocket_client.py --raw-latency  # Show negative latencies
 """
 
 import asyncio
