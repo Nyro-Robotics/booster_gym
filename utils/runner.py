@@ -64,8 +64,9 @@ class Runner:
                     self.cfg["env"][arg] = getattr(self.args, arg)
                 else:
                     self.cfg["basic"][arg] = getattr(self.args, arg)
-        if not self.test:
-            self.cfg["viewer"]["record_video"] = False
+        # Enable video recording for test mode (play.py)
+        if self.test:
+            self.cfg["viewer"]["record_video"] = True
 
     def _set_seed(self):
         if self.cfg["basic"]["seed"] == -1:
@@ -220,6 +221,7 @@ class Runner:
         if self.cfg["viewer"]["record_video"]:
             os.makedirs("videos", exist_ok=True)
             name = time.strftime("%Y-%m-%d-%H-%M-%S.mp4", time.localtime())
+            video_path = os.path.join("videos", name)
             record_time = self.cfg["viewer"]["record_interval"]
         while True:
             with torch.no_grad():
@@ -233,9 +235,10 @@ class Runner:
                     record_time += self.cfg["viewer"]["record_interval"]
                     self.interrupt = False
                     signal.signal(signal.SIGINT, self.interrupt_handler)
-                    with imageio.get_writer(os.path.join("videos", name), fps=int(1.0 / self.env.dt)) as self.writer:
+                    with imageio.get_writer(video_path, fps=int(1.0 / self.env.dt)) as self.writer:
                         for frame in self.env.camera_frames:
                             self.writer.append_data(frame)
+                    print(f"Video saved to: {os.path.abspath(video_path)}")
                     if self.interrupt:
                         raise KeyboardInterrupt
                     signal.signal(signal.SIGINT, signal.default_int_handler)

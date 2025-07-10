@@ -9,9 +9,9 @@ basic:
 
 env:
   num_envs: 4096
-  num_observations: 47
-  num_privileged_obs: 14
-  num_actions: 12
+  num_observations: 92  # Updated for 27 actions: 11 + 3 * 27 = 92
+  num_privileged_obs: 14  # Unchanged
+  num_actions: 27  # Updated for actual controlled joints (excluding hand joints)
   env_spacing: 1.  # not used with plane terrain
 
 runner:
@@ -57,9 +57,10 @@ sim:
     contact_collection: 1 # 0: CC_NEVER (don't collect contact info), 1: CC_LAST_SUBSTEP (collect only contacts on last substep), 2: CC_ALL_SUBSTEPS (broken - do not use!)
 
 asset:
-  file: "resources/T1/T1_locomotion.urdf"
+  file: "resources/T1_7DoF/T1_with_inspire.urdf"  # Updated to use T1_with_inspire.urdf
   mujoco_locomotion_file: "resources/T1/T1_locomotion.xml"
   mujoco_serial_file: "resources/T1/T1_serial.xml"
+  # mujoco_serial_file: "resources/T1/T1_7_dof_arm_serial_with_head_arm.xml"
   name: "T1"
   base_name: "Trunk"
   foot_names: ["left_foot_link", "right_foot_link"]
@@ -87,11 +88,31 @@ init_state:
   rot: [0.0, 0.0, 0.0, 1.0] # x,y,z,w [quat]
   lin_vel: [0.0, 0.0, 0.0]  # x,y,z [m/s]
   ang_vel: [0.0, 0.0, 0.0]  # x,y,z [rad/s]
-  default_joint_angles: {"Hip_Pitch": -0.2, "Knee_Pitch": 0.4, "Ankle_Pitch": -0.25, "default": 0.} # target angles when action = 0.0
+  # Updated joint angles for T1_with_inspire.urdf joints
+  default_joint_angles: {
+    "AAHead_yaw": 0.004, "Head_pitch": 0.009,
+    "Left_Shoulder_Pitch": 0.467, "Left_Shoulder_Roll": -1.094, "Left_Elbow_Pitch": 0.024, "Left_Elbow_Yaw": -1.460, "Left_Wrist_Pitch": -0.002, "Left_Wrist_Yaw": 0.027,
+    "Right_Shoulder_Pitch": 0.472, "Right_Shoulder_Roll": 1.091, "Right_Elbow_Pitch": 0.021, "Right_Elbow_Yaw": 1.448, "Right_Wrist_Pitch": -0.001, "Right_Wrist_Yaw": -0.014,
+    "Waist": 0.002,
+    "Left_Hip_Pitch": -0.094, "Left_Hip_Roll": 0.001, "Left_Hip_Yaw": 0.001, "Left_Knee_Pitch": 0.211, "Left_Ankle_Pitch": -0.085, "Left_Ankle_Roll": -0.009,
+    "Right_Hip_Pitch": -0.096, "Right_Hip_Roll": 0.003, "Right_Hip_Yaw": -0.000, "Right_Knee_Pitch": 0.208, "Right_Ankle_Pitch": -0.085, "Right_Ankle_Roll": 0.008,
+    "default": 0.0
+  }
 
 control:
-  stiffness: {"Hip": 200., "Knee": 200., "Ankle": 50.} # [N*m/rad]
-  damping: {"Hip": 5., "Knee": 5., "Ankle": 1.} # [N*m*s/rad]
+  # Updated stiffness and damping for T1_with_inspire.urdf joints
+  stiffness: {
+    "Head": 7.0, "AAHead": 7.0,
+    "Shoulder": 18.0, "Elbow": 18.0, "Wrist": 18.0,
+    "Waist": 30.0,
+    "Hip": 200.0, "Knee": 200.0, "Ankle": 50.0
+  }
+  damping: {
+    "Head": 0.5, "AAHead": 0.5,
+    "Shoulder": 1.0, "Elbow": 1.0, "Wrist": 1.0,
+    "Waist": 3.0,
+    "Hip": 5.0, "Knee": 5.0, "Ankle": 1.0
+  }
   action_scale: 1.
   decimation: 10
 
