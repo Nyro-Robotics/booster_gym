@@ -23,7 +23,7 @@ lower_body_positions = [0.0] * 12  # Joints 17-28
 arm_stiffness_factor = 2.0  # Downscale arm stiffness by 0.8
 
 # Joint position smoothing parameters
-joint_smoothing_factor = 0.8  # How much to keep of previous value (0.0 = no smoothing, 0.9 = heavy smoothing)
+joint_smoothing_factor = 0.1  # How much to keep of previous value (0.0 = no smoothing, 0.9 = heavy smoothing)
 filtered_joint_positions = {}  # Store smoothed joint positions
 
 # Simple finger command timing
@@ -31,20 +31,20 @@ last_finger_command_time = 0.0
 finger_command_interval = 0.05  # 20Hz - faster than before but slower than 100Hz
 
 # More reasonable thresholds - allow normal movements but filter small noise
-finger_command_threshold = 150  # 15% of range - allows normal movements
+finger_command_threshold = 100  # 15% of range - allows normal movements
 last_finger_positions = {'left': {}, 'right': {}}  # Track last commanded positions per finger per hand
 smoothed_finger_positions = {'left': {}, 'right': {}}  # Track smoothed finger positions  
-finger_smoothing_factor = 0.2  # Light smoothing to filter noise but stay responsive
+finger_smoothing_factor = 0.05  # Light smoothing to filter noise but stay responsive
 
 # Per-finger timing to prevent rapid commands to same finger
 finger_last_command_time = {'left': {}, 'right': {}}  # Track last command time per finger
-finger_min_interval = 0.2  # Minimum 200ms between commands to same finger (much more reasonable)
+finger_min_interval = 0.1  # Minimum 200ms between commands to same finger (much more reasonable)
 
 # Finger feedback tracking to prevent vibrations
 actual_finger_positions = {'left': {}, 'right': {}}  # Track actual finger positions from robot
 finger_settled_positions = {'left': {}, 'right': {}}  # Track where fingers have settled
-finger_settlement_threshold = 20  # If finger moves less than this, consider it "settled"
-finger_settlement_tolerance = 50  # If commanded vs actual position is within this, stop commanding
+finger_settlement_threshold = 0  # If finger moves less than this, consider it "settled"
+finger_settlement_tolerance = 0  # If commanded vs actual position is within this, stop commanding
 last_hand_data_read_time = 0.0
 hand_data_read_interval = 0.1  # Read hand positions every 100ms
 
@@ -251,7 +251,7 @@ def hand_oscillation(client: B1LocoClient):
                 finger_param.seq = i
                 finger_param.angle = int(target_angle)
                 finger_param.force = 10  # Low force as requested
-                finger_param.speed = 1000  # Maximum speed
+                finger_param.speed = 600  # Maximum speed
                 finger_params.append(finger_param)
             
             # Send command to RIGHT hand
@@ -304,7 +304,7 @@ def close_hands(client: B1LocoClient):
         finger_param.seq = i
         finger_param.angle = closed_positions[i]
         finger_param.force = 800  # Low force as requested
-        finger_param.speed = 1000  # Maximum speed
+        finger_param.speed = 600  # Maximum speed
         finger_params.append(finger_param)
     
     # Send command to RIGHT hand
@@ -350,7 +350,7 @@ def open_hands(client: B1LocoClient):
         finger_param.seq = i
         finger_param.angle = open_positions[i]
         finger_param.force = 800  # Low force as requested
-        finger_param.speed = 1000  # Maximum speed
+        finger_param.speed = 600  # Maximum speed
         finger_params.append(finger_param)
     
     # Send command to RIGHT hand
@@ -460,8 +460,8 @@ def map_hand_data_to_finger_params(hand_data: Dict[str, float], hand_side: str) 
                 finger_param = DexterousFingerParameter()
                 finger_param.seq = finger_seq
                 finger_param.angle = target_angle
-                finger_param.force = 800  # Same as hand_oscillation
-                finger_param.speed = 1000  # Same as hand_oscillation
+                finger_param.force = 600  # Same as hand_oscillation
+                finger_param.speed = 600  # Same as hand_oscillation
                 finger_params.append(finger_param)
                 
                 # Update tracking for this finger
