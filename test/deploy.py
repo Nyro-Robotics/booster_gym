@@ -58,7 +58,7 @@ min_latency = float('inf')
 max_latency = 0.0
 last_latency_report_time = 0.0
 
-def prepare_robot(client: B1LocoClient):
+def prepare_robot(client: B1LocoClient, communication_mode="websocket", ws_host="localhost", ws_port=8765, zmq_address="tcp://localhost:5555"):
     """Send robot to a stable prepare pose before switching to custom mode"""
     global current_positions
     
@@ -92,6 +92,9 @@ def prepare_robot(client: B1LocoClient):
         current_positions = [0.0] * 29
     else:
         print("Successfully read current robot positions!")
+    
+    # Send current joint positions to teleoperator for initialization
+    send_robot_joint_positions_to_teleoperator(current_positions, communication_mode, ws_host, ws_port, zmq_address)
     
     # Store lower body positions to maintain them during teleoperation
     global lower_body_positions
@@ -1125,6 +1128,140 @@ def stop_teleoperation():
     print("✅ Teleoperation stopped successfully")
     return True
 
+def send_robot_joint_positions_to_teleoperator(joint_positions, communication_mode="websocket", ws_host="localhost", ws_port=8765, zmq_address="tcp://localhost:5555"):
+    """Send current robot joint positions to teleoperator for initialization"""
+    print("📤 Sending robot joint positions to teleoperator...")
+    
+    # Map joint positions to organized structure for teleoperator
+    joint_mapping = {
+        # Head joints
+        "AAHead_yaw": 0, "Head_pitch": 1,
+        # Left arm joints  
+        "Left_Shoulder_Pitch": 2, "Left_Shoulder_Roll": 3, "Left_Elbow_Pitch": 4, 
+        "Left_Elbow_Yaw": 5, "Left_Wrist_Pitch": 6, "Left_Wrist_Yaw": 7, "Left_Hand_Roll": 8,
+        # Right arm joints
+        "Right_Shoulder_Pitch": 9, "Right_Shoulder_Roll": 10, "Right_Elbow_Pitch": 11, 
+        "Right_Elbow_Yaw": 12, "Right_Wrist_Pitch": 13, "Right_Wrist_Yaw": 14, "Right_Hand_Roll": 15,
+        # Waist joint
+        "Waist": 16
+    }
+    
+    # Create organized joint data structure
+    organized_joints = {}
+    for joint_name, joint_index in joint_mapping.items():
+        if joint_index < len(joint_positions):
+            organized_joints[joint_name] = joint_positions[joint_index]
+    
+    # Create initialization message
+    init_message = {
+        "type": "robot_joint_initialization",
+        "timestamp": time.time(),
+        "data": {
+            "organized": {
+                "upper_body": organized_joints,
+                "left_hand": {},  # No hand joints in this initialization
+                "right_hand": {}  # No hand joints in this initialization
+            }
+        },
+        "metadata": {
+            "source": "deploy_robot_hardware",
+            "robot_mode": "mc_initialization",
+            "total_joints": len(organized_joints),
+            "description": "Current robot joint positions for teleoperator initialization"
+        }
+    }
+    
+    # Send via the specified communication mode
+    if communication_mode == "websocket":
+        _send_initialization_message_websocket(init_message, ws_host, ws_port)
+    elif communication_mode == "zeromq":
+        _send_initialization_message_zeromq(init_message, zmq_address)
+    else:
+        print(f"⚠️ Unknown communication mode: {communication_mode}")
+        print("   Trying both WebSocket and ZeroMQ...")
+        _send_initialization_message_websocket(init_message, ws_host, ws_port)
+        _send_initialization_message_zeromq(init_message, zmq_address)
+
+def _send_initialization_message_websocket(message, ws_host="localhost", ws_port=8765):
+    """Send initialization message via WebSocket"""
+    try:
+        import websockets
+        import asyncio
+        
+        async def send_message():
+            # Use the specified WebSocket host/port
+            uri = f"ws://{ws_host}:{ws_port}"
+            try:
+                async with websockets.connect(uri, ping_timeout=2, close_timeout=2) as websocket:
+                    await websocket.send(json.dumps(message))
+                    print(f"✅ Robot joint positions sent via WebSocket to {uri}")
+            except Exception as e:
+                print(f"⚠️ WebSocket initialization send failed: {e}")
+        
+        # Run the async function
+        asyncio.run(send_message())
+        
+    except ImportError:
+        print("⚠️ WebSocket library not available for initialization message")
+    except Exception as e:
+        print(f"⚠️ WebSocket initialization failed: {e}")
+
+def _send_initialization_message_zeromq(message, zmq_address="tcp://localhost:5555"):
+    """Send initialization message via ZeroMQ"""
+    try:
+        import zmq
+        import re
+        
+        # Calculate the initialization address (port + 1)
+        init_address = zmq_address
+        if zmq_address.startswith('tcp://'):
+            match = re.search(r'tcp://([^:]+):(\d+)', zmq_address)
+            if match:
+                host = match.group(1)
+                port = int(match.group(2)) + 1  # Use port + 1 for initialization
+                init_address = f"tcp://{host}:{port}"
+        
+        # Create ZeroMQ context and socket
+        context = zmq.Context()
+        socket = context.socket(zmq.PUB)
+        
+        # Configure socket for quick send
+        socket.setsockopt(zmq.LINGER, 0)  # Don't linger on close
+        socket.setsockopt(zmq.SNDHWM, 1)  # Low high water mark
+        
+        # Connect to the initialization address
+        socket.connect(init_address)
+        
+        # Give ZeroMQ a moment to establish connection
+        time.sleep(0.5)  # Longer delay for PUB/SUB pattern to ensure subscriber is ready
+        
+        # Send message with topic multiple times to ensure delivery
+        topic = b"robot_joint_initialization"
+        message_bytes = json.dumps(message).encode('utf-8')
+        
+        print(f"📤 Sending robot joint initialization message to {init_address}")
+        print(f"   Topic: {topic}")
+        print(f"   Message size: {len(message_bytes)} bytes")
+        
+        # Send multiple times to ensure delivery (PUB/SUB can miss initial messages)
+        for i in range(3):
+            socket.send_multipart([topic, message_bytes])
+            time.sleep(0.1)
+        
+        print(f"✅ Robot joint positions sent via ZeroMQ to {init_address} (sent 3 times)")
+        
+        # Give a moment for the message to be sent
+        time.sleep(0.2)
+        
+        # Clean up
+        socket.close()
+        context.term()
+        
+    except ImportError:
+        print("⚠️ ZeroMQ library not available for initialization message")
+    except Exception as e:
+        print(f"⚠️ ZeroMQ initialization failed: {e}")
+
 def main():
     if len(sys.argv) < 2:
         print(f"Usage: {sys.argv[0]} networkInterface [--communication {{'websocket', 'zeromq'}}] [--ws-host HOST] [--ws-port PORT] [--zmq-address ADDRESS]")
@@ -1201,7 +1338,7 @@ def main():
             if input_cmd:
                 if input_cmd == 'mc':
                     print("Preparing robot for custom mode...")
-                    success = prepare_robot(client)
+                    success = prepare_robot(client, args.communication, args.ws_host, args.ws_port, args.zmq_address)
                     if not success:
                         print("Failed to prepare robot for custom mode")
                 elif input_cmd == 'teleop':
