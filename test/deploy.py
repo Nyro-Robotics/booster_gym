@@ -1,8 +1,6 @@
 from booster_robotics_sdk_python import B1LocoClient, ChannelFactory, RobotMode, B1HandIndex, GripperControlMode, Position, Orientation, Posture, GripperMotionParameter, Quaternion, Frame, Transform, DexterousFingerParameter, LowCmd, LowCmdType, MotorCmd, B1LowCmdPublisher, B1LowStateSubscriber, B1LowHandDataScriber
 import sys, time, random, math
 import asyncio
-import websockets
-import json
 import threading
 import argparse
 from typing import Dict, Any, Optional
@@ -10,7 +8,14 @@ from collections import deque
 import numpy as np
 from concurrent.futures import ThreadPoolExecutor
 import queue
-import zmq
+
+# Import utility modules
+from utils.websocket_client import WebSocketClient, send_initialization_message_websocket, create_robot_joint_initialization_message
+from utils.zeromq_client import ZeroMQClient, send_initialization_message_zeromq
+from utils.hand_controls import (
+    hand_oscillation, close_hands, open_hands, read_hand_data,
+    map_hand_data_to_finger_params, apply_current_reduction_to_finger_command
+)
 
 # Global variables for teleoperation
 teleop_active = False
@@ -20,7 +25,14 @@ latest_hand_data = {}
 robot_client = None
 current_positions = [0.0] * 29
 lower_body_positions = [0.0] * 12  # Joints 17-28
-arm_stiffness_factor = 2.0  # Downscale arm stiffness by 0.8
+arm_stiffness_factor = 2.0 
+
+# Stiffness ramping system for smooth teleop initialization
+stiffness_ramp_active = False
+stiffness_ramp_start_time = 0.0
+stiffness_ramp_duration = 5.0  # 5 seconds to ramp from low to target stiffness
+min_stiffness_factor = 0.1  # Start at 10% of target stiffness (very low but not zero)
+target_stiffness_factor = 1.0  # Target stiffness factor
 
 # Joint position smoothing parameters
 joint_smoothing_factor = 0.1  # How much to keep of previous value (0.0 = no smoothing, 0.9 = heavy smoothing)
@@ -29,24 +41,6 @@ filtered_joint_positions = {}  # Store smoothed joint positions
 # Simple finger command timing
 last_finger_command_time = 0.0
 finger_command_interval = 0.05  # 20Hz - faster than before but slower than 100Hz
-
-# More reasonable thresholds - allow normal movements but filter small noise
-finger_command_threshold = 100  # 15% of range - allows normal movements
-last_finger_positions = {'left': {}, 'right': {}}  # Track last commanded positions per finger per hand
-smoothed_finger_positions = {'left': {}, 'right': {}}  # Track smoothed finger positions  
-finger_smoothing_factor = 0.05  # Light smoothing to filter noise but stay responsive
-
-# Per-finger timing to prevent rapid commands to same finger
-finger_last_command_time = {'left': {}, 'right': {}}  # Track last command time per finger
-finger_min_interval = 0.1  # Minimum 200ms between commands to same finger (much more reasonable)
-
-# Finger feedback tracking to prevent vibrations
-actual_finger_positions = {'left': {}, 'right': {}}  # Track actual finger positions from robot
-finger_settled_positions = {'left': {}, 'right': {}}  # Track where fingers have settled
-finger_settlement_threshold = 0  # If finger moves less than this, consider it "settled"
-finger_settlement_tolerance = 0  # If commanded vs actual position is within this, stop commanding
-last_hand_data_read_time = 0.0
-hand_data_read_interval = 0.1  # Read hand positions every 100ms
 
 # Latency tracking variables
 latency_window_size = 100  # Track last 100 messages for latency stats
@@ -121,23 +115,23 @@ def prepare_robot(client: B1LocoClient, communication_mode="websocket", ws_host=
         low_cmd.motor_cmd[i].kd = 0.0
         low_cmd.motor_cmd[i].weight = 0.0
     
-    # Basic gains for holding position
+    # Base gains for teleoperation
     kps = [
-        2.0, 2.0,                                    # Head
+        5.0, 5.0,                                    # Head
         15.0, 15.0, 15.0, 15.0, 10.0, 15.0, 10.0,   # Left arm
         15.0, 15.0, 15.0, 15.0, 10.0, 15.0, 10.0,   # Right arm  
-        100., 
-        350., 350., 180., 350., 450., 450.,
-        350., 350., 180., 350., 450., 450.,
+        100.,                                        # Waist
+        350., 350., 180., 350., 450., 450.,          # Left leg
+        350., 350., 180., 350., 450., 450.,          # Right leg
     ]
     
     kds = [
-        0.3, 0.3,                                   # Head
-        3.0, 3.0, 3.0, 3.0, 3.0, 3.0, 3.0,         # Left arm
-        3.0, 3.0, 3.0, 3.0, 3.0, 3.0, 3.0,         # Right arm
-        5.0,
-        7.5, 7.5, 3., 5.5, 0.5, 0.5,
-        7.5, 7.5, 3., 5.5, 0.5, 0.5,
+        0.1, 0.1,                                   # Head
+        1.0, 2.0, 2.0, 1.0, 1.0, 1.0, 1.0,         # Left arm
+        1.0, 2.0, 2.0, 1.0, 1.0, 1.0, 1.0,         # Right arm
+        5.0,                                        # Waist
+        7.5, 7.5, 3., 5.5, 0.5, 0.5,               # Left leg
+        7.5, 7.5, 3., 5.5, 0.5, 0.5,               # Right leg
     ]
     
     # Joint names for debugging
@@ -188,196 +182,45 @@ def prepare_robot(client: B1LocoClient, communication_mode="websocket", ws_host=
     
     return True
 
-def read_hand_data(hand_index=B1HandIndex.kRightHand, duration=2.0):
-    """Read hand data for the specified hand for a given duration"""
-    print(f"Reading hand data for {'right' if hand_index == B1HandIndex.kRightHand else 'left'} hand...")
+def calculate_current_stiffness_factor() -> float:
+    """Calculate current stiffness factor based on ramping progress"""
+    global stiffness_ramp_active, stiffness_ramp_start_time, stiffness_ramp_duration
+    global min_stiffness_factor, target_stiffness_factor
     
-    def handler(hand_data_msg):
-        print("Received hand message:")
-        for i, data in enumerate(hand_data_msg.hand_data):
-            print(f" seq:{data.seq} angle:{data.angle}, force:{data.force}, current:{data.current}, status:{data.status}, temp:{data.temp}, error:{data.error}")
-        print(f" hand index:{hand_data_msg.hand_index} hand type:{hand_data_msg.hand_type}")
-        print("done")
+    if not stiffness_ramp_active:
+        return target_stiffness_factor
     
-    # Create subscriber
-    channel_subscriber = B1LowHandDataScriber(handler)
-    channel_subscriber.InitChannel()
-    print("Hand data subscriber initialized")
+    # Calculate ramp progress (0.0 to 1.0)
+    current_time = time.time()
+    elapsed_time = current_time - stiffness_ramp_start_time
+    ramp_progress = min(1.0, elapsed_time / stiffness_ramp_duration)
     
-    # Read data for specified duration
-    start_time = time.time()
-    while (time.time() - start_time) < duration:
-        time.sleep(0.1)
+    # End ramping when complete
+    if ramp_progress >= 1.0:
+        stiffness_ramp_active = False
+        print(f"🎯 Stiffness ramping complete - now at target stiffness ({target_stiffness_factor:.1f})")
     
-    # Clean up
-    channel_subscriber.CloseChannel()
-    print("Hand data reading completed")
+    # Smooth ramping using a sine curve for gentler transitions
+    smooth_progress = 0.5 * (1.0 - math.cos(math.pi * ramp_progress))
+    current_factor = min_stiffness_factor + (target_stiffness_factor - min_stiffness_factor) * smooth_progress
+    
+    return current_factor
 
-def hand_oscillation(client: B1LocoClient):
-    # 定义一个 名为 finger_params 的数组，用于存储每个手指的参数
-    print("Reading hand data for both hands...")
-    read_hand_data(B1HandIndex.kRightHand, 1.0)
-    read_hand_data(B1HandIndex.kLeftHand, 1.0)
-
-    # Base positions for each finger - starting with everything open (high angles)
-    base_positions = [900, 850, 800, 850, 900, 950]
+def start_stiffness_ramping():
+    """Start the stiffness ramping process"""
+    global stiffness_ramp_active, stiffness_ramp_start_time, arm_stiffness_factor
     
-    # Sinusoidal parameters
-    amplitude = 300  # How much the fingers oscillate
-    frequency = 1.0  # Hz - oscillations per second
-    duration = 10.0  # Total duration in seconds
+    stiffness_ramp_active = True
+    stiffness_ramp_start_time = time.time()
     
-    print(f"Starting sinusoidal hand movement on BOTH hands for {duration} seconds...")
-    print("Press Ctrl+C to stop early")
-    
-    start_time = time.time()
-    
-    try:
-        while (time.time() - start_time) < duration:
-            current_time = time.time() - start_time
-            
-            finger_params = []
-            
-            # Calculate sinusoidal angles for each finger
-            for i in range(6):
-                # Add phase offset for each finger to create wave-like motion
-                phase_offset = i * 0.5  # Different phase for each finger
-                
-                # Calculate sinusoidal angle
-                sin_value = amplitude * math.sin(2 * math.pi * frequency * current_time + phase_offset)
-                target_angle = base_positions[i] + sin_value
-                
-                # Clamp angle to reasonable bounds (0-1000)
-                target_angle = max(0, min(1000, target_angle))
-                
-                finger_param = DexterousFingerParameter()
-                finger_param.seq = i
-                finger_param.angle = int(target_angle)
-                finger_param.force = 10  # Low force as requested
-                finger_param.speed = 600  # Maximum speed
-                finger_params.append(finger_param)
-            
-            # Send command to RIGHT hand
-            res_right = client.ControlDexterousHand(finger_params, B1HandIndex.kRightHand)
-            if res_right != 0:
-                print(f"Right hand sinusoidal command failed: error = {res_right}")
-            
-            # Send command to LEFT hand
-            res_left = client.ControlDexterousHand(finger_params, B1HandIndex.kLeftHand)
-            if res_left != 0:
-                print(f"Left hand sinusoidal command failed: error = {res_left}")
-            
-            # Break if both hands failed
-            if res_right != 0 and res_left != 0:
-                break
-            
-            # Print current angles every 0.5 seconds
-            if int(current_time * 2) != int((current_time - 0.2) * 2):
-                angles_str = ", ".join([f"{p.angle}" for p in finger_params])
-                print(f"t={current_time:.1f}s: BOTH HANDS [{angles_str}]")
-            
-            # Delay between commands (100Hz)
-            time.sleep(0.01)
-            
-    except KeyboardInterrupt:
-        print("\nSinusoidal motion interrupted by user")
-    
-    print("Sinusoidal hand movement completed on both hands")
-    print("Reading final hand data...")
-    read_hand_data(B1HandIndex.kRightHand, 1.0)
-    read_hand_data(B1HandIndex.kLeftHand, 1.0)
-
-def close_hands(client: B1LocoClient):
-    """Close all fingers on both hands"""
-    print("Reading hand data for both hands...")
-    read_hand_data(B1HandIndex.kRightHand, 1.0)
-    read_hand_data(B1HandIndex.kLeftHand, 1.0)
-    
-    # Closed positions for each finger (low angles = closed)
-    closed_positions = [100, 150, 200, 150, 100, 50]  # Tight fist positions
-    
-    print("Closing all fingers on BOTH hands...")
-    print("Using maximum speed, low force (10)")
-    
-    finger_params = []
-    
-    # Set closed angles for each finger
-    for i in range(6):
-        finger_param = DexterousFingerParameter()
-        finger_param.seq = i
-        finger_param.angle = closed_positions[i]
-        finger_param.force = 800  # Low force as requested
-        finger_param.speed = 600  # Maximum speed
-        finger_params.append(finger_param)
-    
-    # Send command to RIGHT hand
-    res_right = client.ControlDexterousHand(finger_params, B1HandIndex.kRightHand)
-    if res_right != 0:
-        print(f"Right hand close command failed: error = {res_right}")
-    else:
-        print("✅ Right hand closed successfully")
-    
-    # Send command to LEFT hand
-    res_left = client.ControlDexterousHand(finger_params, B1HandIndex.kLeftHand)
-    if res_left != 0:
-        print(f"Left hand close command failed: error = {res_left}")
-    else:
-        print("✅ Left hand closed successfully")
-    
-    # Print final angles
-    angles_str = ", ".join([f"{p.angle}" for p in finger_params])
-    print(f"Final closed positions: [{angles_str}]")
-    
-    print("Hand closing completed on both hands")
-    print("Reading final hand data...")
-    read_hand_data(B1HandIndex.kRightHand, 1.0)
-    read_hand_data(B1HandIndex.kLeftHand, 1.0)
-
-def open_hands(client: B1LocoClient):
-    """Open all fingers on both hands"""
-    print("Reading hand data for both hands...")
-    read_hand_data(B1HandIndex.kRightHand, 1.0)
-    read_hand_data(B1HandIndex.kLeftHand, 1.0)
-    
-    # Open positions for each finger (high angles = open)
-    open_positions = [900, 850, 800, 850, 900, 950]  # Fully open positions
-    
-    print("Opening all fingers on BOTH hands...")
-    print("Using maximum speed, low force (10)")
-    
-    finger_params = []
-    
-    # Set open angles for each finger
-    for i in range(6):
-        finger_param = DexterousFingerParameter()
-        finger_param.seq = i
-        finger_param.angle = open_positions[i]
-        finger_param.force = 800  # Low force as requested
-        finger_param.speed = 600  # Maximum speed
-        finger_params.append(finger_param)
-    
-    # Send command to RIGHT hand
-    res_right = client.ControlDexterousHand(finger_params, B1HandIndex.kRightHand)
-    if res_right != 0:
-        print(f"Right hand open command failed: error = {res_right}")
-    else:
-        print("✅ Right hand opened successfully")
-    
-    # Send command to LEFT hand
-    res_left = client.ControlDexterousHand(finger_params, B1HandIndex.kLeftHand)
-    if res_left != 0:
-        print(f"Left hand open command failed: error = {res_left}")
-    else:
-        print("✅ Left hand opened successfully")
-    
-    # Print final angles
-    angles_str = ", ".join([f"{p.angle}" for p in finger_params])
-    print(f"Final open positions: [{angles_str}]")
-    
-    print("Hand opening completed on both hands")
-    print("Reading final hand data...")
-    read_hand_data(B1HandIndex.kRightHand, 1.0)
-    read_hand_data(B1HandIndex.kLeftHand, 1.0)
+    print(f"🔄 Starting stiffness ramping:")
+    print(f"   Duration: {stiffness_ramp_duration:.1f} seconds")
+    print(f"   Start factor: {min_stiffness_factor:.1f} ({min_stiffness_factor*100:.0f}% of base values)")
+    print(f"   Target factor: {target_stiffness_factor:.1f} ({target_stiffness_factor*100:.0f}% of target values)")
+    print(f"   Arm stiffness factor: {arm_stiffness_factor:.1f} (applied to target values)")
+    print(f"   Example: Base arm kp=15.0 → Target arm kp={15.0*arm_stiffness_factor:.1f}")
+    print(f"   Ramping: {15.0*min_stiffness_factor:.1f} → {15.0*arm_stiffness_factor:.1f} over {stiffness_ramp_duration:.1f}s")
+    print(f"   Curve: Smooth sine-based ramping for gentle transitions")
 
 def map_joint_name_to_index(joint_name: str) -> Optional[int]:
     """Map joint name to robot joint index"""
@@ -395,172 +238,12 @@ def map_joint_name_to_index(joint_name: str) -> Optional[int]:
     }
     return joint_mapping.get(joint_name)
 
-def update_actual_finger_positions():
-    """This function is no longer needed with the simplified approach"""
-    pass
-
-def map_hand_data_to_finger_params(hand_data: Dict[str, float], hand_side: str) -> list:
-    """Map hand joint data to finger parameters with conservative thresholds and per-finger timing"""
-    global finger_command_threshold, last_finger_positions, smoothed_finger_positions, finger_smoothing_factor
-    global finger_last_command_time, finger_min_interval
-    
-    finger_params = []
-    current_time = time.time()
-    
-    # Updated mapping for new joint names (based on the WebSocket hardware interface)
-    finger_mapping = {
-        "thumb_proximal_yaw_joint": 5,       # Thumb rotation
-        "thumb_proximal_pitch_joint": 4,     # Thumb bending  
-        "index_proximal_joint": 3,           # Index finger
-        "middle_proximal_joint": 2,          # Middle finger
-        "ring_proximal_joint": 1,            # Ring finger
-        "pinky_proximal_joint": 0,           # Little finger
-    }
-    
-    # Initialize hand tracking if not exists
-    if hand_side not in last_finger_positions:
-        last_finger_positions[hand_side] = {}
-    if hand_side not in smoothed_finger_positions:
-        smoothed_finger_positions[hand_side] = {}
-    if hand_side not in finger_last_command_time:
-        finger_last_command_time[hand_side] = {}
-    
-    # Process finger data with heavy filtering and conservative thresholds
-    for joint_name, joint_value in hand_data.items():
-        finger_seq = finger_mapping.get(joint_name)
-        
-        if finger_seq is not None:
-            # INVERT the finger command: 1000-x (as requested)
-            inverted_value = 1000 - joint_value
-            raw_angle = max(0, min(1000, int(inverted_value)))
-            
-            # Apply heavy smoothing to filter out noise
-            if finger_seq in smoothed_finger_positions[hand_side]:
-                smoothed_angle = (
-                    smoothed_finger_positions[hand_side][finger_seq] * finger_smoothing_factor + 
-                    raw_angle * (1.0 - finger_smoothing_factor)
-                )
-            else:
-                # Initialize with current value
-                smoothed_angle = raw_angle
-            
-            # Update smoothed position
-            smoothed_finger_positions[hand_side][finger_seq] = smoothed_angle
-            target_angle = int(smoothed_angle)
-            
-            # Check per-finger timing - don't command same finger too frequently
-            last_cmd_time = finger_last_command_time[hand_side].get(finger_seq, 0)
-            if (current_time - last_cmd_time) < finger_min_interval:
-                # Too soon since last command to this finger - skip
-                continue
-            
-            # Conservative threshold check - only send commands for MAJOR movements
-            last_angle = last_finger_positions[hand_side].get(finger_seq, 500)
-            change_amount = abs(target_angle - last_angle)
-            
-            if change_amount >= finger_command_threshold:
-                # Create finger command (same settings as hand_oscillation)
-                finger_param = DexterousFingerParameter()
-                finger_param.seq = finger_seq
-                finger_param.angle = target_angle
-                finger_param.force = 600  # Same as hand_oscillation
-                finger_param.speed = 600  # Same as hand_oscillation
-                finger_params.append(finger_param)
-                
-                # Update tracking for this finger
-                last_finger_positions[hand_side][finger_seq] = target_angle
-                finger_last_command_time[hand_side][finger_seq] = current_time
-                
-                print(f"🤚 {hand_side.upper()} finger {finger_seq}: BIG MOVE {last_angle}→{target_angle} (change: {change_amount})")
-    
-    return finger_params
-
-async def websocket_client_handler(host: str = "localhost", port: int = 8765):
-    """Handle WebSocket connection and message processing"""
-    global latest_joint_data, latest_hand_data, teleop_active
-    global message_latencies, joint_position_latencies, total_latency_sum, total_latency_count, min_latency, max_latency
-    
-    uri = f"ws://{host}:{port}"
-    
-    try:
-        print(f"🔌 Connecting to WebSocket server at {uri}")
-        
-        async with websockets.connect(uri) as websocket:
-            print(f"✅ Connected to WebSocket server successfully!")
-            print(f"🎯 Listening for teleoperation commands...")
-            
-            async for message in websocket:
-                if not teleop_active:
-                    break
-                    
-                try:
-                    # Capture receive time immediately for latency calculation
-                    receive_time = time.time()
-                    
-                    # Parse JSON message
-                    data = json.loads(message)
-                    message_type = data.get('type', 'unknown')
-                    
-                    # Calculate latency if message has timestamp
-                    latency_ms = None
-                    message_timestamp = data.get('timestamp')
-                    if message_timestamp is not None:
-                        latency_s = receive_time - message_timestamp
-                        latency_ms = latency_s * 1000  # Convert to milliseconds
-                        
-                        # Update global latency statistics
-                        message_latencies.append(latency_ms)
-                        total_latency_sum += latency_ms
-                        total_latency_count += 1
-                        min_latency = min(min_latency, latency_ms)
-                        max_latency = max(max_latency, latency_ms)
-                        
-                        # Track joint position specific latency
-                        if message_type == 'joint_positions':
-                            joint_position_latencies.append(latency_ms)
-                    
-                    if message_type == 'joint_positions':
-                        # Extract organized joint data (no fallback to all_joints)
-                        message_data = data.get('data', {})
-                        organized = message_data.get('organized', {})
-                        
-                        # Validate that we have the expected organized structure
-                        if not organized:
-                            print(f"⚠️ Warning: Received joint_positions message without organized data structure")
-                            continue
-                        
-                        if 'upper_body' not in organized:
-                            print(f"⚠️ Warning: Missing 'upper_body' in organized data")
-                            continue
-                        
-                        # Update latest joint data with organized structure
-                        latest_joint_data = organized.copy()
-                        
-                        # Extract hand data from organized data
-                        latest_hand_data = {
-                            'left_hand': organized.get('left_hand', {}),
-                            'right_hand': organized.get('right_hand', {})
-                        }
-                except json.JSONDecodeError as e:
-                    print(f"❌ JSON decode error: {e}")
-                except Exception as e:
-                    print(f"❌ Error processing message: {e}")
-                    
-    except ConnectionRefusedError:
-        print(f"❌ Connection refused to {uri}")
-        print(f"   Make sure the WebSocket relay server is running")
-    except Exception as e:
-        print(f"❌ WebSocket error: {e}")
-    finally:
-        print(f"🔌 Disconnected from WebSocket server")
-
 def teleoperation_control_loop(client: B1LocoClient):
     """Main teleoperation control loop running at 100Hz"""
     global teleop_active, latest_joint_data, latest_hand_data, current_positions, lower_body_positions, arm_stiffness_factor
     global joint_smoothing_factor, filtered_joint_positions, last_finger_command_time, finger_command_interval
-    global finger_command_threshold, finger_deadband, last_finger_positions, smoothed_finger_positions, finger_smoothing_factor
-    global actual_finger_positions, finger_settled_positions, finger_settlement_threshold, finger_settlement_tolerance
-    global last_hand_data_read_time, hand_data_read_interval
+    global stiffness_ramp_active, stiffness_ramp_start_time, stiffness_ramp_duration
+    global min_stiffness_factor, target_stiffness_factor
 
     # Create low-level command publisher
     low_cmd_publisher = B1LowCmdPublisher()
@@ -576,7 +259,7 @@ def teleoperation_control_loop(client: B1LocoClient):
     
     # Base gains for teleoperation
     base_kps = [
-        2.0, 2.0,                                    # Head
+        5.0, 5.0,                                    # Head
         15.0, 15.0, 15.0, 15.0, 10.0, 15.0, 10.0,   # Left arm
         15.0, 15.0, 15.0, 15.0, 10.0, 15.0, 10.0,   # Right arm  
         100.,                                        # Waist
@@ -585,26 +268,30 @@ def teleoperation_control_loop(client: B1LocoClient):
     ]
     
     base_kds = [
-        0.3, 0.3,                                   # Head
-        1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0,         # Left arm
-        1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0,         # Right arm
+        0.1, 0.1,                                   # Head
+        1.0, 2.0, 2.0, 1.0, 1.0, 1.0, 1.0,         # Left arm
+        1.0, 2.0, 2.0, 1.0, 1.0, 1.0, 1.0,         # Right arm
         5.0,                                        # Waist
         7.5, 7.5, 3., 5.5, 0.5, 0.5,               # Left leg
         7.5, 7.5, 3., 5.5, 0.5, 0.5,               # Right leg
     ]
     
-    # Apply arm stiffness factor to arm joints only (joints 2-8 and 9-15)
-    kps = base_kps.copy()
-    kds = base_kds.copy()
+    # Calculate target stiffness values that include arm_stiffness_factor
+    target_kps = base_kps.copy()
+    target_kds = base_kds.copy()
     
-    # Apply arm stiffness factor to left arm (joints 2-8)
-    for i in range(2, 9):
-        kps[i] *= arm_stiffness_factor
+    # Apply arm_stiffness_factor to arm joints (2-8 and 9-15) and waist (16)
+    for i in range(2, 17):  # Arms and waist
+        target_kps[i] = base_kps[i] * arm_stiffness_factor
+        target_kds[i] = base_kds[i]  # Damping doesn't get arm_stiffness_factor
     
-    # Apply arm stiffness factor to right arm (joints 9-15)  
-    for i in range(9, 16):
-        kps[i] *= arm_stiffness_factor
+    print(f"🎯 Target stiffness values (including arm_stiffness_factor={arm_stiffness_factor}):")
+    print(f"   Left arm kp: {target_kps[2]:.1f}, {target_kps[3]:.1f}, {target_kps[4]:.1f}, {target_kps[5]:.1f}, {target_kps[6]:.1f}, {target_kps[7]:.1f}, {target_kps[8]:.1f}")
+    print(f"   Right arm kp: {target_kps[9]:.1f}, {target_kps[10]:.1f}, {target_kps[11]:.1f}, {target_kps[12]:.1f}, {target_kps[13]:.1f}, {target_kps[14]:.1f}, {target_kps[15]:.1f}")
+    print(f"   Waist kp: {target_kps[16]:.1f}")
     
+    # Start stiffness ramping for smooth teleop initialization
+    start_stiffness_ramping()
     
     start_time = time.time()
     command_count = 0
@@ -613,12 +300,29 @@ def teleoperation_control_loop(client: B1LocoClient):
         while teleop_active:
             loop_start_time = time.time()
             
-            # Initialize all motor commands
+            # Calculate current stiffness factor (ramps up over time)
+            current_stiffness_factor = calculate_current_stiffness_factor()
+            
+            # Calculate dynamic gains by ramping from minimum to target values
+            dynamic_kps = base_kps.copy()
+            dynamic_kds = base_kds.copy()
+            
+            # For joints that have modified target values, ramp from min to target
+            for i in range(29):
+                if i < len(target_kps):
+                    # Ramp from (base * min_factor) to target value
+                    min_kp = base_kps[i] * min_stiffness_factor
+                    dynamic_kps[i] = min_kp + (target_kps[i] - min_kp) * current_stiffness_factor
+                    
+                    min_kd = base_kds[i] * min_stiffness_factor  
+                    dynamic_kds[i] = min_kd + (target_kds[i] - min_kd) * current_stiffness_factor
+            
+            # Initialize all motor commands with dynamic gains
             for i in range(29):
                 low_cmd.motor_cmd[i].q = current_positions[i]
                 low_cmd.motor_cmd[i].dq = 0.0
-                low_cmd.motor_cmd[i].kp = kps[i]
-                low_cmd.motor_cmd[i].kd = kds[i]
+                low_cmd.motor_cmd[i].kp = dynamic_kps[i] if i < len(dynamic_kps) else base_kps[i]
+                low_cmd.motor_cmd[i].kd = dynamic_kds[i] if i < len(dynamic_kds) else base_kds[i]
                 low_cmd.motor_cmd[i].tau = 0.0
             
             # Apply joint commands from WebSocket using organized data with smoothing
@@ -694,15 +398,17 @@ def teleoperation_control_loop(client: B1LocoClient):
                 latency_stats = get_latency_statistics()
                 latency_report = format_latency_report(latency_stats, detailed=False)
                 
+                # Get current stiffness for reporting
+                current_stiffness_for_report = calculate_current_stiffness_factor()
+                
                 print(f"📊 Teleoperation stats: {actual_hz:.1f}Hz, {command_count} commands sent")
                 print(f"   Latest joint data keys: {list(latest_joint_data.keys()) if latest_joint_data else 'None'}")
                 print(f"   Latest hand data: L={len(latest_hand_data.get('left_hand', {}))}, R={len(latest_hand_data.get('right_hand', {}))}")
+                print(f"   Stiffness: {current_stiffness_for_report:.2f} {'(ramping)' if stiffness_ramp_active else '(stable)'}")
                 print(f"   Arm stiffness factor: {arm_stiffness_factor}")
                 print(f"   Joint smoothing factor: {joint_smoothing_factor}")
                 print(f"   Filtered joints: {len(filtered_joint_positions)}")
-                print(f"   Finger timing: {finger_command_interval:.3f}s ({1/finger_command_interval:.0f}Hz) + inversion + light smoothing + reasonable thresholds")
-                print(f"   Finger settings: inverted commands, light smoothing: {finger_smoothing_factor}, threshold: {finger_command_threshold}")
-                print(f"   Per-finger timing: min {finger_min_interval:.1f}s between commands to same finger")
+                print(f"   Finger control: {finger_command_interval:.3f}s ({1/finger_command_interval:.0f}Hz) with current reduction")
                 print(f"   {latency_report}")
                 
                 # Network quality assessment for teleoperation
@@ -734,16 +440,19 @@ def teleoperation_control_loop(client: B1LocoClient):
         final_latency_stats = get_latency_statistics()
         detailed_latency_report = format_latency_report(final_latency_stats, detailed=True)
         
+        # Get final stiffness factor
+        final_stiffness_factor = calculate_current_stiffness_factor()
+        
         print(f"📊 Final teleoperation stats:")
         print(f"   Duration: {elapsed_time:.1f}s")
         print(f"   Commands sent: {command_count}")
         print(f"   Average frequency: {actual_hz:.1f}Hz")
+        print(f"   Final stiffness factor: {final_stiffness_factor:.2f} {'(complete)' if not stiffness_ramp_active else '(ramping)'}")
+        print(f"   Stiffness ramping: {min_stiffness_factor:.1f} → {target_stiffness_factor:.1f} over {stiffness_ramp_duration:.1f}s")
         print(f"   Arm stiffness factor used: {arm_stiffness_factor}")
         print(f"   Joint smoothing factor used: {joint_smoothing_factor}")
         print(f"   Total filtered joints: {len(filtered_joint_positions)}")
         print(f"   Finger timing used: {finger_command_interval:.3f}s ({1/finger_command_interval:.0f}Hz) + inversion + light smoothing + reasonable thresholds")
-        print(f"   Finger settings: inverted commands, light smoothing: {finger_smoothing_factor}, threshold: {finger_command_threshold}")
-        print(f"   Per-finger timing: min {finger_min_interval:.1f}s between commands to same finger")
         
         # Detailed latency analysis
         print(f"\n🕐 FINAL LATENCY ANALYSIS:")
@@ -786,14 +495,6 @@ def teleoperation_control_loop(client: B1LocoClient):
         
         # Clear filtered positions for next session
         filtered_joint_positions.clear()
-        
-        # Clear finger tracking for next session
-        last_finger_positions.clear()
-        smoothed_finger_positions.clear()
-        finger_last_command_time.clear()
-        
-        # Reset timing
-        last_finger_command_time = 0.0
 
 def reset_latency_tracking():
     """Reset all latency tracking variables for a new session"""
@@ -884,124 +585,6 @@ def format_latency_report(stats: Dict[str, Any], detailed: bool = False) -> str:
     
     return "\n".join(lines) if lines else "🕐 Latency: Calculating..."
 
-def zeromq_subscriber_handler(zmq_address: str = "tcp://localhost:5555"):
-    """Handle ZeroMQ subscriber connection and message processing - optimized for low latency"""
-    global latest_joint_data, latest_hand_data, teleop_active
-    global message_latencies, joint_position_latencies, total_latency_sum, total_latency_count, min_latency, max_latency
-    
-    # Initialize ZeroMQ context and socket
-    context = zmq.Context()
-    socket = context.socket(zmq.SUB)
-    
-    # Optimized socket options for high-frequency, low-latency operation
-    socket.setsockopt(zmq.RCVHWM, 10)      # Very low high water mark to minimize buffering
-    socket.setsockopt(zmq.SNDHWM, 10)      # Low send high water mark
-    socket.setsockopt(zmq.RCVTIMEO, 1)     # 1ms timeout instead of 1000ms for quick polling
-    socket.setsockopt(zmq.LINGER, 0)       # Don't linger on close
-    socket.setsockopt(zmq.TCP_KEEPALIVE, 1) # Enable TCP keepalive
-    socket.setsockopt(zmq.TCP_KEEPALIVE_IDLE, 1)  # 1 second keepalive idle
-    socket.setsockopt(zmq.TCP_KEEPALIVE_INTVL, 1) # 1 second keepalive interval
-    socket.setsockopt(zmq.SUBSCRIBE, b"joint_positions")  # Subscribe to joint_positions topic
-    
-    # Create a poller for efficient message checking
-    poller = zmq.Poller()
-    poller.register(socket, zmq.POLLIN)
-    
-    try:
-        print(f"🔌 Connecting to ZeroMQ publisher at {zmq_address}")
-        socket.connect(zmq_address)
-        print(f"✅ Connected to ZeroMQ publisher successfully!")
-        print(f"🎯 Listening for teleoperation commands via ZeroMQ (optimized for low latency)...")
-        
-        message_count = 0
-        last_stats_time = time.time()
-        
-        while teleop_active:
-            try:
-                # Use poller for efficient checking (1ms timeout for responsive checking)
-                socks = dict(poller.poll(1))  # 1ms poll timeout
-                
-                if socket in socks and socks[socket] == zmq.POLLIN:
-                    # Message available - receive immediately
-                    topic, message = socket.recv_multipart(zmq.NOBLOCK)
-                    receive_time = time.time()
-                    message_count += 1
-                    
-                    # Parse JSON message
-                    data = json.loads(message.decode('utf-8'))
-                    message_type = data.get('type', 'unknown')
-                    
-                    # Calculate latency if message has timestamp
-                    latency_ms = None
-                    message_timestamp = data.get('timestamp')
-                    if message_timestamp is not None:
-                        latency_s = receive_time - message_timestamp
-                        latency_ms = latency_s * 1000  # Convert to milliseconds
-                        
-                        # Update global latency statistics
-                        message_latencies.append(latency_ms)
-                        total_latency_sum += latency_ms
-                        total_latency_count += 1
-                        min_latency = min(min_latency, latency_ms)
-                        max_latency = max(max_latency, latency_ms)
-                        
-                        # Track joint position specific latency
-                        if message_type == 'joint_positions':
-                            joint_position_latencies.append(latency_ms)
-                    
-                    if message_type == 'joint_positions':
-                        # Extract organized joint data (no fallback to all_joints)
-                        message_data = data.get('data', {})
-                        organized = message_data.get('organized', {})
-                        
-                        # Validate that we have the expected organized structure
-                        if not organized:
-                            print(f"⚠️ Warning: Received joint_positions message without organized data structure")
-                            continue
-                        
-                        if 'upper_body' not in organized:
-                            print(f"⚠️ Warning: Missing 'upper_body' in organized data")
-                            continue
-                        
-                        # Update latest joint data with organized structure
-                        latest_joint_data = organized.copy()
-                        
-                        # Extract hand data from organized data
-                        latest_hand_data = {
-                            'left_hand': organized.get('left_hand', {}),
-                            'right_hand': organized.get('right_hand', {})
-                        }
-                        
-                    # Print periodic statistics (every 5 seconds)
-                    if time.time() - last_stats_time > 5.0:
-                        msg_rate = message_count / (time.time() - last_stats_time) if (time.time() - last_stats_time) > 0 else 0
-                        print(f"⚡ ZeroMQ: {message_count} messages in {time.time() - last_stats_time:.1f}s ({msg_rate:.1f} Hz)")
-                        if latency_ms:
-                            print(f"   Current latency: {latency_ms:.1f}ms")
-                        message_count = 0
-                        last_stats_time = time.time()
-                        
-                else:
-                    # No message available - brief sleep to prevent CPU spinning
-                    time.sleep(0.0001)  # 0.1ms sleep to be CPU-friendly while staying responsive
-                    
-            except zmq.Again:
-                # No message available (shouldn't happen with poller, but just in case)
-                time.sleep(0.0001)  # 0.1ms sleep
-                continue
-            except json.JSONDecodeError as e:
-                print(f"❌ JSON decode error: {e}")
-            except Exception as e:
-                print(f"❌ Error processing ZeroMQ message: {e}")
-                
-    except Exception as e:
-        print(f"❌ ZeroMQ error: {e}")
-    finally:
-        print(f"🔌 Disconnected from ZeroMQ publisher")
-        poller.unregister(socket)
-        socket.close()
-        context.term()
-
 def start_teleoperation(client: B1LocoClient, communication_mode: str = "websocket", 
                       ws_host: str = "localhost", ws_port: int = 8765, 
                       zmq_address: str = "tcp://localhost:5555"):
@@ -1023,9 +606,32 @@ def start_teleoperation(client: B1LocoClient, communication_mode: str = "websock
     if communication_mode == "websocket":
         print(f"   WebSocket server: {ws_host}:{ws_port}")
         
+        # Create WebSocket client
+        ws_client = WebSocketClient(ws_host, ws_port)
+        
+        # Create wrapper classes for shared data (since we need to pass by reference)
+        class SharedBool:
+            def __init__(self, value):
+                self.value = value
+        
+        class SharedFloat:
+            def __init__(self, value):
+                self.value = value
+        
+        teleop_active_ref = SharedBool(teleop_active)
+        total_latency_sum_ref = SharedFloat(total_latency_sum)
+        total_latency_count_ref = SharedFloat(total_latency_count)
+        min_latency_ref = SharedFloat(min_latency)
+        max_latency_ref = SharedFloat(max_latency)
+        
         # Start WebSocket client in a separate thread
         websocket_thread = threading.Thread(
-            target=lambda: asyncio.run(websocket_client_handler(ws_host, ws_port)),
+            target=lambda: asyncio.run(ws_client.handle_connection(
+                teleop_active_ref, latest_joint_data, latest_hand_data,
+                message_latencies, joint_position_latencies,
+                total_latency_sum_ref, total_latency_count_ref,
+                min_latency_ref, max_latency_ref
+            )),
             daemon=True
         )
         websocket_thread.start()
@@ -1033,9 +639,32 @@ def start_teleoperation(client: B1LocoClient, communication_mode: str = "websock
     elif communication_mode == "zeromq":
         print(f"   ZeroMQ publisher: {zmq_address}")
         
+        # Create ZeroMQ client
+        zmq_client = ZeroMQClient(zmq_address)
+        
+        # Create wrapper classes for shared data (since we need to pass by reference)
+        class SharedBool:
+            def __init__(self, value):
+                self.value = value
+        
+        class SharedFloat:
+            def __init__(self, value):
+                self.value = value
+        
+        teleop_active_ref = SharedBool(teleop_active)
+        total_latency_sum_ref = SharedFloat(total_latency_sum)
+        total_latency_count_ref = SharedFloat(total_latency_count)
+        min_latency_ref = SharedFloat(min_latency)
+        max_latency_ref = SharedFloat(max_latency)
+        
         # Start ZeroMQ subscriber in a separate thread
         zeromq_thread = threading.Thread(
-            target=lambda: zeromq_subscriber_handler(zmq_address),
+            target=lambda: zmq_client.handle_subscriber(
+                teleop_active_ref, latest_joint_data, latest_hand_data,
+                message_latencies, joint_position_latencies,
+                total_latency_sum_ref, total_latency_count_ref,
+                min_latency_ref, max_latency_ref
+            ),
             daemon=True
         )
         zeromq_thread.start()
@@ -1049,7 +678,7 @@ def start_teleoperation(client: B1LocoClient, communication_mode: str = "websock
     print("   Upper body: Following commands")
     print("   Lower body: Maintaining current positions")
     print("   Latency tracking: Enabled (requires timestamps in messages)")
-    print(f"   Finger control: {finger_command_interval:.3f}s ({1/finger_command_interval:.0f}Hz) with balanced approach")
+    print(f"   Finger control: {finger_command_interval:.3f}s ({1/finger_command_interval:.0f}Hz) with current reduction")
 
     print("Teleoperation Commands:")
     print(f"  teleop  - Start teleoperation mode")
@@ -1078,27 +707,16 @@ def start_teleoperation(client: B1LocoClient, communication_mode: str = "websock
     print()
     print("📊 TELEOPERATION FEATURES:")
     print("  • Real-time joint position control at 100Hz")
-    print("  • Hand/finger control with inverted commands + light smoothing + reasonable thresholds") 
+    print("  • Hand/finger control with current reduction for power efficiency") 
     print("  • Joint position smoothing to reduce jitter")
-    print(f"  • Finger control: {finger_command_interval:.3f}s ({1/finger_command_interval:.0f}Hz) with balanced approach")
+    print(f"  • Finger control: {finger_command_interval:.3f}s ({1/finger_command_interval:.0f}Hz) with current reduction")
     print("  • Per-finger timing prevents rapid-fire commands")
     print("  • Reasonable thresholds allow normal movements while filtering noise")
     print("  • Configurable arm stiffness scaling")
+    print(f"  • Smart stiffness ramping: {min_stiffness_factor:.1f} → {target_stiffness_factor:.1f} over {stiffness_ramp_duration:.1f}s for smooth initialization")
     print("  • Network latency monitoring and quality assessment")
     print("  • Periodic statistics reporting every 10 seconds")
     print("=" * 60)
-    print()
-    print("🤚 FINGER CONTROL FEATURES:")
-    print("  • Balanced thresholds to allow normal movements while filtering noise")
-    print(f"  • Moderate timing: {finger_command_interval:.3f}s ({1/finger_command_interval:.0f}Hz) - balanced between responsiveness and stability")
-    print(f"  • Finger inversion: Input commands (0-1000) inverted to (1000-0) for robot")
-    print(f"  • Light smoothing (factor: {finger_smoothing_factor}) to filter out noise while staying responsive")
-    print(f"  • Reasonable threshold: {finger_command_threshold} units - allows normal movements")
-    print(f"  • Per-finger timing: minimum {finger_min_interval:.1f}s between commands to same finger")
-    print("  • Same command structure as working hand_oscillation function")
-    print("  • Force: 10, Speed: 1000 (exactly matching hand_oscillation)")
-    print("  • Unified approach for both hands (no complex per-hand logic)")
-    print("  • Prevents vibration through balanced filtering and timing")
 
     # Start control loop in main thread
     try:
@@ -1132,135 +750,19 @@ def send_robot_joint_positions_to_teleoperator(joint_positions, communication_mo
     """Send current robot joint positions to teleoperator for initialization"""
     print("📤 Sending robot joint positions to teleoperator...")
     
-    # Map joint positions to organized structure for teleoperator
-    joint_mapping = {
-        # Head joints
-        "AAHead_yaw": 0, "Head_pitch": 1,
-        # Left arm joints  
-        "Left_Shoulder_Pitch": 2, "Left_Shoulder_Roll": 3, "Left_Elbow_Pitch": 4, 
-        "Left_Elbow_Yaw": 5, "Left_Wrist_Pitch": 6, "Left_Wrist_Yaw": 7, "Left_Hand_Roll": 8,
-        # Right arm joints
-        "Right_Shoulder_Pitch": 9, "Right_Shoulder_Roll": 10, "Right_Elbow_Pitch": 11, 
-        "Right_Elbow_Yaw": 12, "Right_Wrist_Pitch": 13, "Right_Wrist_Yaw": 14, "Right_Hand_Roll": 15,
-        # Waist joint
-        "Waist": 16
-    }
-    
-    # Create organized joint data structure
-    organized_joints = {}
-    for joint_name, joint_index in joint_mapping.items():
-        if joint_index < len(joint_positions):
-            organized_joints[joint_name] = joint_positions[joint_index]
-    
-    # Create initialization message
-    init_message = {
-        "type": "robot_joint_initialization",
-        "timestamp": time.time(),
-        "data": {
-            "organized": {
-                "upper_body": organized_joints,
-                "left_hand": {},  # No hand joints in this initialization
-                "right_hand": {}  # No hand joints in this initialization
-            }
-        },
-        "metadata": {
-            "source": "deploy_robot_hardware",
-            "robot_mode": "mc_initialization",
-            "total_joints": len(organized_joints),
-            "description": "Current robot joint positions for teleoperator initialization"
-        }
-    }
+    # Create initialization message using utility function
+    init_message = create_robot_joint_initialization_message(joint_positions)
     
     # Send via the specified communication mode
     if communication_mode == "websocket":
-        _send_initialization_message_websocket(init_message, ws_host, ws_port)
+        send_initialization_message_websocket(init_message, ws_host, ws_port)
     elif communication_mode == "zeromq":
-        _send_initialization_message_zeromq(init_message, zmq_address)
+        send_initialization_message_zeromq(init_message, zmq_address)
     else:
         print(f"⚠️ Unknown communication mode: {communication_mode}")
         print("   Trying both WebSocket and ZeroMQ...")
-        _send_initialization_message_websocket(init_message, ws_host, ws_port)
-        _send_initialization_message_zeromq(init_message, zmq_address)
-
-def _send_initialization_message_websocket(message, ws_host="localhost", ws_port=8765):
-    """Send initialization message via WebSocket"""
-    try:
-        import websockets
-        import asyncio
-        
-        async def send_message():
-            # Use the specified WebSocket host/port
-            uri = f"ws://{ws_host}:{ws_port}"
-            try:
-                async with websockets.connect(uri, ping_timeout=2, close_timeout=2) as websocket:
-                    await websocket.send(json.dumps(message))
-                    print(f"✅ Robot joint positions sent via WebSocket to {uri}")
-            except Exception as e:
-                print(f"⚠️ WebSocket initialization send failed: {e}")
-        
-        # Run the async function
-        asyncio.run(send_message())
-        
-    except ImportError:
-        print("⚠️ WebSocket library not available for initialization message")
-    except Exception as e:
-        print(f"⚠️ WebSocket initialization failed: {e}")
-
-def _send_initialization_message_zeromq(message, zmq_address="tcp://localhost:5555"):
-    """Send initialization message via ZeroMQ"""
-    try:
-        import zmq
-        import re
-        
-        # Calculate the initialization address (port + 1)
-        init_address = zmq_address
-        if zmq_address.startswith('tcp://'):
-            match = re.search(r'tcp://([^:]+):(\d+)', zmq_address)
-            if match:
-                host = match.group(1)
-                port = int(match.group(2)) + 1  # Use port + 1 for initialization
-                init_address = f"tcp://{host}:{port}"
-        
-        # Create ZeroMQ context and socket
-        context = zmq.Context()
-        socket = context.socket(zmq.PUB)
-        
-        # Configure socket for quick send
-        socket.setsockopt(zmq.LINGER, 0)  # Don't linger on close
-        socket.setsockopt(zmq.SNDHWM, 1)  # Low high water mark
-        
-        # Connect to the initialization address
-        socket.connect(init_address)
-        
-        # Give ZeroMQ a moment to establish connection
-        time.sleep(0.5)  # Longer delay for PUB/SUB pattern to ensure subscriber is ready
-        
-        # Send message with topic multiple times to ensure delivery
-        topic = b"robot_joint_initialization"
-        message_bytes = json.dumps(message).encode('utf-8')
-        
-        print(f"📤 Sending robot joint initialization message to {init_address}")
-        print(f"   Topic: {topic}")
-        print(f"   Message size: {len(message_bytes)} bytes")
-        
-        # Send multiple times to ensure delivery (PUB/SUB can miss initial messages)
-        for i in range(3):
-            socket.send_multipart([topic, message_bytes])
-            time.sleep(0.1)
-        
-        print(f"✅ Robot joint positions sent via ZeroMQ to {init_address} (sent 3 times)")
-        
-        # Give a moment for the message to be sent
-        time.sleep(0.2)
-        
-        # Clean up
-        socket.close()
-        context.term()
-        
-    except ImportError:
-        print("⚠️ ZeroMQ library not available for initialization message")
-    except Exception as e:
-        print(f"⚠️ ZeroMQ initialization failed: {e}")
+        send_initialization_message_websocket(init_message, ws_host, ws_port)
+        send_initialization_message_zeromq(init_message, zmq_address)
 
 def main():
     if len(sys.argv) < 2:
