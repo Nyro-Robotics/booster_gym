@@ -100,7 +100,14 @@ class PolicyDeploy:
         # Residual upper body action configuration
         self.residual_upper_body_action = self.config.get("residual_upper_body_action", False)
         self.upper_dof_indices = np.arange(self.num_upper_dofs)  # First 16 joints are upper body
-        self.ref_upper_dof_pos = self.default_dof_angles[:self.num_upper_dofs].reshape(1, -1)
+        
+        # Use stand keyframe positions as upper body goals (with elbow angles 1.4/-1.4 instead of 2.2/-2.2)
+        stand_upper_body_pos = np.array([
+            0.004, 0.009,  # Head
+            0.467, -1.094, 0.024, 1.4, -0.002, 0.027, -0.009,  # Left arm 
+            0.472, 1.091, 0.021, -1.4, -0.001, -0.014, 0.005   # Right arm
+        ])
+        self.ref_upper_dof_pos = stand_upper_body_pos.reshape(1, -1)
         
         # Initialize SDK
         ChannelFactory.Instance().Init(self.config["DOMAIN_ID"], self.config["NET"])
@@ -134,7 +141,7 @@ class PolicyDeploy:
         self.lin_vel_command = np.array([0.0, 0.0])  # [forward/backward, left/right]
         self.ang_vel_command = np.array([0.0])       # [yaw rotation]
         self.base_height_command = np.array([self.config["DESIRED_BASE_HEIGHT"]])
-        self.stand_command = np.array([1.0])  # 1.0 = walking mode, 0.0 = stance mode
+        self.stand_command = np.array([0.0])  # 1.0 = walking mode, 0.0 = stance mode (start in stance)
         
         # KP/KD scaling factors (can be modified during runtime)
         self.kp_scale = 1.0
@@ -274,8 +281,8 @@ class PolicyDeploy:
         control_dt = 1.0 / control_freq
         num_steps = int(transition_duration / control_dt)
         
-        # Get prepare gains
-        prepare_kps = self.config["prepare"]["stiffness"]
+        # Get prepare gains - use higher stiffness for better position tracking during transition
+        prepare_kps = np.array(self.config["prepare"]["stiffness"]) * 2.0  # Double the stiffness for transition
         prepare_kds = self.config["prepare"]["damping"]
         
         start_positions = self.current_positions.copy()
@@ -549,7 +556,7 @@ class PolicyDeploy:
                             low_cmd.motor_cmd[i].kd = self.base_kds[i] * self.kd_scale
                             low_cmd.motor_cmd[i].tau = 0.0
                         
-                        breakpoint()
+                        # breakpoint()
                         # Send command
                         low_cmd_publisher.Write(low_cmd)
                         
