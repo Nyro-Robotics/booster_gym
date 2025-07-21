@@ -25,7 +25,7 @@ latest_hand_data = {}
 robot_client = None
 current_positions = [0.0] * 29
 lower_body_positions = [0.0] * 12  # Joints 17-28
-arm_stiffness_factor = 2.0 
+arm_stiffness_factor = 2.5 
 
 # Stiffness ramping system for smooth teleop initialization
 stiffness_ramp_active = False
@@ -127,8 +127,8 @@ def prepare_robot(client: B1LocoClient, communication_mode="websocket", ws_host=
     
     kds = [
         0.1, 0.1,                                   # Head
-        1.0, 2.0, 2.0, 1.0, 1.0, 1.0, 1.0,         # Left arm
-        1.0, 2.0, 2.0, 1.0, 1.0, 1.0, 1.0,         # Right arm
+        2.0, 2.0, 2.0, 2.0, 2.0, 1.0, 1.0,         # Left arm
+        2.0, 2.0, 2.0, 2.0, 2.0, 1.0, 1.0,         # Right arm
         5.0,                                        # Waist
         7.5, 7.5, 3., 5.5, 0.5, 0.5,               # Left leg
         7.5, 7.5, 3., 5.5, 0.5, 0.5,               # Right leg
