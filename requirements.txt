@@ -7,3 +7,6 @@ mujoco-python-viewer
 opencv-python
 tqdm
 pygame
+loop_rate_limiters
+termcolor
+onnxruntime
