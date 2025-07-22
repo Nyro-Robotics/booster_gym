@@ -1,6 +1,4 @@
 from .base import BasicCommandSender
-from .unitree import UnitreeCommandSender
-from .booster import BoosterCommandSender
 
 
 def create_command_sender(config):
@@ -16,8 +14,10 @@ def create_command_sender(config):
     sdk_type = config.get("SDK_TYPE", "unitree")
     
     if sdk_type == "unitree":
+        from .unitree import UnitreeCommandSender
         return UnitreeCommandSender(config)
     elif sdk_type == "booster":
+        from .booster import BoosterCommandSender
         return BoosterCommandSender(config)
     else:
         raise ValueError(f"Unsupported SDK type: {sdk_type}")

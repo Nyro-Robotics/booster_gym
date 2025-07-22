@@ -53,15 +53,6 @@ JOINT2MOTOR: [0, 1,
               16,
               17, 18, 19, 20, 21, 22,
               23, 24, 25, 26, 27, 28]
-            
-UNITREE_LEGGED_CONST:
-  HIGHLEVEL: 0xEE
-  LOWLEVEL: 0xFF
-  TRIGERLEVEL: 0xF0
-  PosStopF: 2146000000.0
-  VelStopF: 16000.0
-  MODE_MACHINE: 5
-  MODE_PR:  0
 
 JOINT_KP: [
   5, 5, 

@@ -1,6 +1,4 @@
 from .base import BasicStateProcessor
-from .unitree import UnitreeStateProcessor
-from .booster import BoosterStateProcessor
 
 
 def create_state_processor(config):
@@ -16,8 +14,10 @@ def create_state_processor(config):
     sdk_type = config.get("SDK_TYPE", "unitree")
     
     if sdk_type == "unitree":
+        from .unitree import UnitreeStateProcessor
         return UnitreeStateProcessor(config)
     elif sdk_type == "booster":
+        from .booster import BoosterStateProcessor
         return BoosterStateProcessor(config)
     else:
         raise ValueError(f"Unsupported SDK type: {sdk_type}")

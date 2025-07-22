@@ -8,7 +8,6 @@ class Robot:
         self.ROBOT_TYPE = config["ROBOT_TYPE"]
         self.MOTOR2JOINT = config["MOTOR2JOINT"]
         self.JOINT2MOTOR = config["JOINT2MOTOR"]
-        self.UNITREE_LEGGED_CONST = config.get("UNITREE_LEGGED_CONST", None)
         self.MOTOR_KP = np.array(config["MOTOR_KP"])
         self.MOTOR_KD = np.array(config["MOTOR_KD"])
         self.WeakMotorJointIndex = config.get("WeakMotorJointIndex", None)
