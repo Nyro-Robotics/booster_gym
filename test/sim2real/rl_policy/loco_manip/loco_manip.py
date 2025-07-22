@@ -102,12 +102,6 @@ class LocoManipPolicy(DecLocomotionPolicy):
         cmd_tau = np.zeros(self.num_dofs)
         # Get states
         robot_state_data = self.state_processor.robot_state_data
-        
-        # Check if robot state data is available
-        if robot_state_data is None:
-            self.logger.warning("Robot state data not available yet. Waiting for first message...")
-            return
-            
         # self.robot_state_data_shm[0] = robot_state_data
         # Apply upper body controller
         if self.upper_body_controller:

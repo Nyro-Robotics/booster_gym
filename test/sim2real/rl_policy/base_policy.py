@@ -16,8 +16,6 @@ from sim2real.utils.comm import create_state_processor, create_command_sender
 
 from sim2real.utils.robot import Robot
 from sim2real.utils.math import quat_rotate_inverse_numpy
-from unitree_sdk2py.core.channel import ChannelSubscriber
-from unitree_sdk2py.idl.unitree_go.msg.dds_ import WirelessController_
 
 class BasePolicy:
     """
@@ -186,6 +184,8 @@ class BasePolicy:
                 33280: "B+left", 33792: "X+left", 34816: "Y+left",
             }
             if self.sdk_type == "unitree":
+                from unitree_sdk2py.core.channel import ChannelSubscriber
+                from unitree_sdk2py.idl.unitree_go.msg.dds_ import WirelessController_
                 self.wireless_controller_subscriber = ChannelSubscriber(
                     "rt/wirelesscontroller", WirelessController_
                 )
@@ -202,7 +202,7 @@ class BasePolicy:
         threading.Thread(target=self.start_key_listener, daemon=True).start()
         self.logger.info("Keyboard Listener Initialized")
 
-    def wireless_controller_handler(self, msg: WirelessController_):
+    def wireless_controller_handler(self, msg):
         self.wc_msg = msg
 
     # ============================================================================
@@ -319,11 +319,6 @@ class BasePolicy:
         """Execute policy action and send commands to robot."""
         # Get robot state using the wrapper
         robot_state_data = self.state_processor.robot_state_data
-        
-        # Check if robot state data is available
-        if robot_state_data is None:
-            self.logger.warning("Robot state data not available yet. Waiting for first message...")
-            return
         
         # Determine target joint positions
         if self.get_ready_state:
@@ -468,7 +463,6 @@ class BasePolicy:
             self.command_sender.kp_level += 0.1
         elif keycode == "0":
             self.command_sender.kp_level = 1.0
-        self.logger.info(f"KP level: {self.command_sender.kp_level}")
     
     def _handle_joystick_kp_control(self, keycode):
         """Handle joystick KP control."""

@@ -4,22 +4,22 @@ ASSET_ROOT: "../humanoidverse/data/robots/t1" # Robot Asset Root
 ASSET_FILE: "../humanoidverse/data/robots/t1/t1_29dof.urdf" # Robot Asset File"
 
 # Model path for the trained policy
-# model_path: "models/falcon/model_4100.onnx"
-model_path: "../ref/t1_29dof.onnx"
+model_path: "models/t1_29dof/model_9999.onnx"
 
 # Yuanhang
 SDK_TYPE: "booster" # SDK type, "unitree", "booster"
 MOTOR_TYPE: "serial" # Motor type, "serial" or "parallel"
+# NET: 192.168.10.10
 NET: 127.0.0.1
 
 ## SIM
 DOMAIN_ID: 0 # Domain id
-INTERFACE: "enp2s0" # Change from "lo" to your ethernet interface
+INTERFACE: "lo" # in simulation, lo0 for mac, lo for linux
 
 FREE_BASE: False # True
 
 PRINT_SCENE_INFORMATION: True # Print link, joint and sensors information of robot
-ENABLE_ELASTIC_BAND: True   # Virtual spring band, used for lifting h1
+ENABLE_ELASTIC_BAND: True # Virtual spring band, used for lifting h1
 
 SIMULATE_DT: 0.005  # Need to be larger than the runtime of viewer.sync()
 VIEWER_DT: 0.02  # Viewer update time
