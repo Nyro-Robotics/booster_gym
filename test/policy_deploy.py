@@ -101,13 +101,8 @@ class PolicyDeploy:
         self.residual_upper_body_action = self.config.get("residual_upper_body_action", False)
         self.upper_dof_indices = np.arange(self.num_upper_dofs)  # First 16 joints are upper body
         
-        # Use stand keyframe positions as upper body goals (with elbow angles 1.4/-1.4 instead of 2.2/-2.2)
-        stand_upper_body_pos = np.array([
-            0.004, 0.009,  # Head
-            0.467, -1.094, 0.024, 1.4, -0.002, 0.027, -0.009,  # Left arm 
-            0.472, 1.091, 0.021, -1.4, -0.001, -0.014, 0.005   # Right arm
-        ])
-        self.ref_upper_dof_pos = stand_upper_body_pos.reshape(1, -1)
+        # Use default DOF angles for upper body reference positions
+        self.ref_upper_dof_pos = self.default_dof_angles[:self.num_upper_dofs].reshape(1, -1)
         
         # Initialize SDK
         ChannelFactory.Instance().Init(self.config["DOMAIN_ID"], self.config["NET"])
@@ -155,6 +150,13 @@ class PolicyDeploy:
         self.policy_action_scale = 0.25
         self.gait_period = 0.5
         self.phase = 0.0
+        self.phase_time = np.zeros((1, 1))
+        
+        # Waist control command (missing from original)
+        self.waist_dofs_command = np.zeros((1, 3))
+        
+        # Start time for phase calculation
+        self.start_time = time.time()
         
         # Observation buffers for policy
         self.obs_scales = self.config["obs_scales"]
@@ -397,7 +399,10 @@ class PolicyDeploy:
         current_obs_buffer_dict["command_ang_vel"] = self.ang_vel_command.reshape(1, -1) 
         current_obs_buffer_dict["command_stand"] = self.stand_command.reshape(1, -1)
         current_obs_buffer_dict["command_base_height"] = self.base_height_command.reshape(1, -1)
-        current_obs_buffer_dict["command_waist_dofs"] = np.zeros((1, 3))
+        current_obs_buffer_dict["command_waist_dofs"] = self.waist_dofs_command
+        
+        # Add gait phase observations (only phase_time is in config, not sin/cos)
+        current_obs_buffer_dict["phase_time"] = self._get_obs_phase_time()
         
         # Upper body reference positions
         ref_upper_dof_pos = self.default_dof_angles[:self.num_upper_dofs]
@@ -410,6 +415,13 @@ class PolicyDeploy:
             current_obs_buffer_dict["actions"] = self.last_policy_action
         
         return current_obs_buffer_dict
+    
+    def _get_obs_phase_time(self):
+        """Calculate phase time for gait - matching base_policy.py."""
+        cur_time = (time.time() - self.start_time) * self.stand_command[0]
+        phase_time = cur_time % self.gait_period / self.gait_period
+        self.phase_time[:, 0] = phase_time
+        return self.phase_time
     
     def parse_current_obs_dict(self, current_obs_buffer_dict):
         """Parse observation buffer into observation dictionary - matching base_policy.py."""
@@ -525,6 +537,9 @@ class PolicyDeploy:
                 
                 if state_received and self.robot_state_data is not None:
                     try:
+                        # Update gait phase (critical missing piece)
+                        self.phase = (self.phase + loop_time / self.gait_period) % 1.0
+                        
                         # Get policy actions for all joints
                         policy_actions = self.policy_inference(self.robot_state_data)
                         
