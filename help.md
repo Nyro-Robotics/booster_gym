@@ -1,3 +1,5 @@
+cmd: `start-control tcp://10.50.0.6:5555`
+
 # For ~/.bashrc file
 ```bash
 alias start-control='f() { 
